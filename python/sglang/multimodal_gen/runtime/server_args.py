@@ -174,6 +174,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    enable_purlin: bool = False
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -1274,6 +1275,12 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+        parser.add_argument(
+            "--enable-purlin",
+            action=StoreBoolean,
+            default=ServerArgs.enable_purlin,
+            help="Enable the Purlin communication library for supported CUDA collectives.",
         )
 
         ServerArgs.add_disagg_cli_args(parser)

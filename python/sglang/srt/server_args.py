@@ -2148,6 +2148,10 @@ class ServerArgs:
         bool,
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
     ] = False
+    enable_purlin: A[
+        bool,
+        "Enable the Purlin communication library for supported CUDA collectives.",
+    ] = False
     enable_torch_symm_mem: A[
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",

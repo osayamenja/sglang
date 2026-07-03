@@ -159,6 +159,7 @@ def init_parallel_group_coordinator(
     local_rank: int,
     backend: str,
     parallel_mode: str,
+    enable_purlin: bool = False,
     **kwargs,
 ) -> GroupCoordinator:
     """Return a group coordinator for the given parallel mode."""
@@ -183,6 +184,7 @@ def init_parallel_group_coordinator(
             local_rank=local_rank,
             torch_distributed_backend=backend,
             group_name="sp_group",
+            enable_purlin=enable_purlin,
             **kwargs,
         )
     else:
@@ -192,6 +194,7 @@ def init_parallel_group_coordinator(
             torch_distributed_backend=backend,
             use_device_communicator=parallel_mode != "tensor",
             use_srt_custom_allreduce=parallel_mode == "tensor",
+            enable_purlin=enable_purlin,
             group_name=(
                 "tp_group"
                 if parallel_mode == "tensor"
@@ -317,6 +320,7 @@ def initialize_model_parallel(
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
+    enable_purlin: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -401,6 +405,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="data",
+        enable_purlin=enable_purlin,
     )
 
     global _CFG
@@ -410,6 +415,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="classifier_free_guidance",
+        enable_purlin=enable_purlin,
     )
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
@@ -418,6 +424,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="pipeline",
+        enable_purlin=enable_purlin,
     )
 
     global _SP
@@ -454,6 +461,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="sequence",
+        enable_purlin=enable_purlin,
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
@@ -465,6 +473,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="tensor",
+        enable_purlin=enable_purlin,
     )
 
     global _VAE_DECODE
@@ -474,6 +483,7 @@ def initialize_model_parallel(
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="vae_decode",
+        enable_purlin=enable_purlin,
     )
 
     if vae_parallel_size > 0:
@@ -520,6 +530,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    enable_purlin: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -560,6 +571,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        enable_purlin=enable_purlin,
     )
 
     # Only set CUDA device if we're on a CUDA platform

@@ -76,6 +76,17 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+_PURLIN_REDUCE_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+if hasattr(torch, "float8_e5m2"):
+    _PURLIN_REDUCE_DTYPES.add(torch.float8_e5m2)
+if hasattr(torch, "float8_e4m3fn"):
+    _PURLIN_REDUCE_DTYPES.add(torch.float8_e4m3fn)
+_PURLIN_SPLIT_ALIGNMENT = 16
+
+
+def _are_purlin_byte_sizes_aligned(sizes: List[int]) -> bool:
+    return all(size % _PURLIN_SPLIT_ALIGNMENT == 0 for size in sizes)
+
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
@@ -460,6 +471,26 @@ class GroupCoordinator:
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
+        self.purlin: Optional[Any] = None
+        self.purlin_handle: Optional[Any] = None
+        self.enable_purlin = _ENABLE_PURLIN and is_cuda() and self.world_size > 1
+        if self.enable_purlin:
+            try:
+                import purlin
+            except ImportError as e:
+                raise ImportError(
+                    "--enable-purlin requires the purlin package to be installed."
+                ) from e
+
+            major, minor = torch.cuda.get_device_capability(self.device)
+            self.purlin = purlin
+            self.purlin_handle = purlin.initialize(
+                group=self.device_group,
+                device=self.device,
+                arch=major * 10 + minor,
+                stream_ptr=get_current_device_stream_fast().cuda_stream,
+            )
+
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -478,6 +509,36 @@ class GroupCoordinator:
             f"device_group={self.device_group} cpu_group={self.cpu_group} unique_name={self.unique_name} "
             f"world_size={self.world_size} rank_in_group={self.rank_in_group}"
         )
+
+    @staticmethod
+    def _sizes_in_bytes(sizes: List[int], tensor: torch.Tensor) -> List[int]:
+        row_size_in_bytes = tensor.element_size()
+        for dim_size in tensor.shape[1:]:
+            row_size_in_bytes *= dim_size
+        return [size * row_size_in_bytes for size in sizes]
+
+    def _can_use_purlin(
+        self,
+        *tensors: torch.Tensor,
+        require_reduce_dtype: bool = False,
+    ) -> bool:
+        if self.purlin_handle is None:
+            return False
+        for tensor in tensors:
+            if (
+                tensor is None
+                or tensor.is_cpu
+                or not tensor.is_cuda
+                or not tensor.is_contiguous()
+                or tensor.device != self.device
+            ):
+                return False
+        if require_reduce_dtype and tensors[0].dtype not in _PURLIN_REDUCE_DTYPES:
+            return False
+        return True
+
+    def _purlin_stream_ptr(self) -> int:
+        return get_current_device_stream_fast().cuda_stream
 
     @property
     def first_rank(self):
@@ -618,6 +679,10 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
+
+        if self._can_use_purlin(input_, require_reduce_dtype=True):
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
 
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
@@ -771,6 +836,12 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        if self._can_use_purlin(input_, require_reduce_dtype=True):
+            self.purlin.all_reduce(
+                input_, input_, self.purlin_handle, self._purlin_stream_ptr()
+            )
+            return
+
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -826,6 +897,16 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if (
+            self._can_use_purlin(input, output, require_reduce_dtype=True)
+            and input.nbytes % self.world_size == 0
+            and output.nbytes == input.nbytes // self.world_size
+        ):
+            self.purlin.reduce_scatter(
+                input, output, self.purlin_handle, self._purlin_stream_ptr()
+            )
+            return output
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -897,6 +978,16 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        if (
+            self._can_use_purlin(input, output)
+            and input.nbytes == output.nbytes
+            and input.nbytes % self.world_size == 0
+        ):
+            self.purlin.all_to_all(
+                input, output, self.purlin_handle, self._purlin_stream_ptr()
+            )
+            return
+
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
@@ -921,29 +1012,44 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_.shape[0] % world_size == 0
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
 
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
+
+        if self._can_use_purlin(input_, output, require_reduce_dtype=True):
+            if sizes is not None and any(size != sizes[0] for size in sizes):
+                size_bytes = self._sizes_in_bytes(sizes, input_)
+                if _are_purlin_byte_sizes_aligned(size_bytes):
+                    self.purlin.reduce_scatter_v(
+                        input_,
+                        output,
+                        size_bytes,
+                        self.purlin_handle,
+                        self._purlin_stream_ptr(),
+                    )
+                    return output
             else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
-
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
+                self.purlin.reduce_scatter(
+                    input_, output, self.purlin_handle, self._purlin_stream_ptr()
                 )
-            else:
-                assert output.shape == output_shape
+                return output
 
+        pynccl_comm = self.pynccl_comm
+        assert (
+            pynccl_comm is not None and not pynccl_comm.disabled
+        ), "pynccl is required for reduce_scatterv"
+        with pynccl_comm.change_state(enable=True):
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
@@ -976,6 +1082,15 @@ class GroupCoordinator:
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
+
+        if (
+            self._can_use_purlin(input, output)
+            and output.nbytes == input.nbytes * self.world_size
+        ):
+            self.purlin.all_gather(
+                input, output, self.purlin_handle, self._purlin_stream_ptr()
+            )
+            return
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
@@ -1122,56 +1237,83 @@ class GroupCoordinator:
             extra output allocation + caller-side copy.
         """
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
 
-        with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
-
-            def _all_gather_allocate_output(
-                input_: torch.Tensor,
-                sizes: Optional[List[int]] = None,
-                output: Optional[torch.Tensor] = None,
-            ):
-                input_size = input_.size()
-                if sizes is not None:
-                    assert len(sizes) == world_size
-                    assert input_.shape[0] == sizes[self.rank_in_group]
-                    output_size = (sum(sizes),) + input_size[1:]
-                    # 'sizes' is not needed if all inputs in the same group have the same shape
-                    if all(s == sizes[0] for s in sizes):
-                        sizes = None
-                else:
-                    output_size = (input_size[0] * world_size,) + input_size[1:]
-                if output is not None:
-                    assert tuple(output.shape) == tuple(output_size), (
-                        f"all_gatherv output buffer shape {tuple(output.shape)} "
-                        f"!= expected {tuple(output_size)}"
-                    )
-                    return output, sizes
-                # Allocate output tensor.
-                with self.use_symmetric_memory(self, disabled=sizes is not None):
-                    output_tensor = torch.empty(
-                        output_size, dtype=input_.dtype, device=input_.device
-                    )
-                return output_tensor, sizes
-
-            single_input = isinstance(input_, torch.Tensor)
-            if single_input:
-                input_ = [input_]
-            elif output is not None:
-                raise ValueError("all_gatherv `output` requires a single-tensor input")
-
-            output_list = []
-            size_list = []
-            for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(
-                    inp, sizes=sizes, output=output
+        def _all_gather_allocate_output(
+            input_: torch.Tensor,
+            sizes: Optional[List[int]] = None,
+            output: Optional[torch.Tensor] = None,
+        ):
+            input_size = input_.size()
+            if sizes is not None:
+                assert len(sizes) == world_size
+                assert input_.shape[0] == sizes[self.rank_in_group]
+                output_size = (sum(sizes),) + input_size[1:]
+                # 'sizes' is not needed if all inputs in the same group have the same shape
+                if all(s == sizes[0] for s in sizes):
+                    sizes = None
+            else:
+                output_size = (input_size[0] * world_size,) + input_size[1:]
+            if output is not None:
+                assert tuple(output.shape) == tuple(output_size), (
+                    f"all_gatherv output buffer shape {tuple(output.shape)} "
+                    f"!= expected {tuple(output_size)}"
                 )
-                output_list.append(output_tensor)
-                size_list.append(s)
+                return output, sizes
+            # Allocate output tensor.
+            with self.use_symmetric_memory(self, disabled=sizes is not None):
+                output_tensor = torch.empty(
+                    output_size, dtype=input_.dtype, device=input_.device
+                )
+            return output_tensor, sizes
 
+        single_input = isinstance(input_, torch.Tensor)
+        if single_input:
+            input_ = [input_]
+        elif output is not None:
+            raise ValueError("all_gatherv `output` requires a single-tensor input")
+
+        output_list = []
+        size_list = []
+        for inp in input_:
+            output_tensor, s = _all_gather_allocate_output(
+                inp, sizes=sizes, output=output
+            )
+            output_list.append(output_tensor)
+            size_list.append(s)
+
+        if all(
+            self._can_use_purlin(inp, out)
+            for inp, out in zip(input_, output_list)
+        ):
+            can_use_purlin_for_sizes = all(
+                s is None
+                or _are_purlin_byte_sizes_aligned(self._sizes_in_bytes(s, inp))
+                for inp, s in zip(input_, size_list)
+            )
+        else:
+            can_use_purlin_for_sizes = False
+
+        if can_use_purlin_for_sizes:
+            for inp, out, s in zip(input_, output_list, size_list):
+                if s is not None:
+                    self.purlin.all_gather_v(
+                        inp,
+                        out,
+                        self._sizes_in_bytes(s, inp),
+                        self.purlin_handle,
+                        self._purlin_stream_ptr(),
+                    )
+                else:
+                    self.purlin.all_gather(
+                        inp, out, self.purlin_handle, self._purlin_stream_ptr()
+                    )
+            return output_list
+
+        pynccl_comm = self.pynccl_comm
+        assert (
+            pynccl_comm is not None and not pynccl_comm.disabled
+        ), "pynccl is required for all_gatherv"
+        with pynccl_comm.change_state(enable=True):
             pynccl_comm.group_start()
             for i, inp in enumerate(input_):
                 pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
@@ -1595,6 +1737,12 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.purlin_handle is not None:
+            self.purlin.finalize(
+                self.purlin_handle,
+                self._purlin_stream_ptr(),
+            )
+            self.purlin_handle = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -1806,6 +1954,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_PURLIN = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1816,6 +1965,11 @@ def set_custom_all_reduce(enable: bool):
 def set_mscclpp_all_reduce(enable: bool):
     global _ENABLE_MSCCLPP_ALL_REDUCE
     _ENABLE_MSCCLPP_ALL_REDUCE = enable
+
+
+def set_purlin(enable: bool):
+    global _ENABLE_PURLIN
+    _ENABLE_PURLIN = enable
 
 
 def set_torch_symm_mem_all_reduce(enable: bool):

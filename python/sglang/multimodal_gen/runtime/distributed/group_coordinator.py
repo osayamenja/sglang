@@ -24,6 +24,16 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
+    all_to_all as purlin_all_to_all,
+    all_to_all_v as purlin_all_to_all_v,
+    are_aligned_byte_sizes,
+    can_use_purlin,
+    element_counts_to_bytes,
+    finalize_purlin_handle,
+    initialize_purlin_handle,
+    is_purlin_supported_device,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -160,6 +170,7 @@ class GroupCoordinator:
         use_device_communicator: bool = True,
         use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
+        enable_purlin: bool = False,
         group_name: str | None = None,
     ):
         self.unique_name = _get_unique_name(group_name)
@@ -188,6 +199,7 @@ class GroupCoordinator:
 
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
+        self.enable_purlin = enable_purlin
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
@@ -203,6 +215,7 @@ class GroupCoordinator:
                     device=self.device,
                     device_group=self.device_group,
                     unique_name=self.unique_name,
+                    enable_purlin=self.enable_purlin,
                 )
             else:
                 # For MPS and CPU, use the CPU communicator
@@ -329,6 +342,56 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         return self.device_communicator.all_to_all_4D(input_, scatter_dim, gather_dim)
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        async_op: bool = False,
+        stream: torch.cuda.Stream | None = None,
+    ):
+        if self.world_size == 1:
+            output.copy_(input_)
+            return None
+        if self.device_communicator is not None and hasattr(
+            self.device_communicator, "all_to_all_single"
+        ):
+            return self.device_communicator.all_to_all_single(
+                output, input_, async_op=async_op, stream=stream
+            )
+        return torch.distributed.all_to_all_single(
+            output, input_, group=self.device_group, async_op=async_op
+        )
+
+    def all_to_all_v(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        output_split_sizes: list[int],
+        input_split_sizes: list[int],
+        async_op: bool = False,
+    ):
+        if self.world_size == 1:
+            output.copy_(input_)
+            return None
+        if self.device_communicator is not None and hasattr(
+            self.device_communicator, "all_to_all_v"
+        ):
+            return self.device_communicator.all_to_all_v(
+                output,
+                input_,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                async_op=async_op,
+            )
+        return torch.distributed.all_to_all_single(
+            output,
+            input_,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+            async_op=async_op,
+        )
 
     def all_reduce(
         self,
@@ -1256,6 +1319,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=torch_distributed_backend,
+            enable_purlin=kwargs.get("enable_purlin", False),
             group_name=group_name,
         )
         ulysses_group = kwargs.get("ulysses_group", None)
@@ -1275,3 +1339,87 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.ulysses_purlin_handle = None
+        if (
+            self.enable_purlin
+            and self.ulysses_world_size > 1
+            and is_purlin_supported_device(self.device)
+        ):
+            self.ulysses_purlin_handle = initialize_purlin_handle(
+                group=self.ulysses_group,
+                device=self.device,
+            )
+
+    def ulysses_all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        async_op: bool = False,
+        stream: torch.cuda.Stream | None = None,
+    ):
+        if self.ulysses_world_size == 1:
+            output.copy_(input_)
+            return None
+        if (
+            can_use_purlin(self.ulysses_purlin_handle, input_, output)
+            and input_.nbytes == output.nbytes
+            and input_.nbytes % self.ulysses_world_size == 0
+        ):
+            return purlin_all_to_all(
+                input_,
+                output,
+                self.ulysses_purlin_handle,
+                stream=stream,
+                async_op=async_op,
+            )
+        return torch.distributed.all_to_all_single(
+            output, input_, group=self.ulysses_group, async_op=async_op
+        )
+
+    def ulysses_all_to_all_v(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        output_split_sizes: list[int],
+        input_split_sizes: list[int],
+        async_op: bool = False,
+        stream: torch.cuda.Stream | None = None,
+    ):
+        if self.ulysses_world_size == 1:
+            output.copy_(input_)
+            return None
+
+        input_split_bytes = element_counts_to_bytes(input_split_sizes, input_)
+        output_split_bytes = element_counts_to_bytes(output_split_sizes, input_)
+        if (
+            can_use_purlin(self.ulysses_purlin_handle, input_, output)
+            and len(input_split_sizes) == self.ulysses_world_size
+            and len(output_split_sizes) == self.ulysses_world_size
+            and input_.nbytes == sum(input_split_bytes)
+            and output.nbytes == sum(output_split_bytes)
+            and are_aligned_byte_sizes(input_split_bytes + output_split_bytes)
+        ):
+            return purlin_all_to_all_v(
+                input_,
+                output,
+                input_split_sizes,
+                output_split_sizes,
+                self.ulysses_purlin_handle,
+                stream=stream,
+                async_op=async_op,
+            )
+
+        return torch.distributed.all_to_all_single(
+            output,
+            input_,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.ulysses_group,
+            async_op=async_op,
+        )
+
+    def destroy(self) -> None:
+        if self.ulysses_purlin_handle is not None:
+            finalize_purlin_handle(self.ulysses_purlin_handle, self.device)
+            self.ulysses_purlin_handle = None
+        super().destroy()

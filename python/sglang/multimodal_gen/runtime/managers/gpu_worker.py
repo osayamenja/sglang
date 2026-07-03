@@ -213,6 +213,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "127.0.0.1", self.master_port
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            enable_purlin=self.server_args.enable_purlin,
         )
 
         # set proc title

@@ -119,11 +119,13 @@ class DistributedAutograd:
             world_size: int,
             scatter_dim: int,
             gather_dim: int,
+            all_to_all_fn: Any = None,
         ) -> Tensor:
             ctx.group = group
             ctx.world_size = world_size
             ctx.scatter_dim = scatter_dim
             ctx.gather_dim = gather_dim
+            ctx.all_to_all_fn = all_to_all_fn
 
             if world_size == 1:
                 return input_
@@ -144,9 +146,12 @@ class DistributedAutograd:
                 input_ = input_.transpose(0, 2).contiguous()  # hn, shard_seqlen, bs, hd
                 output = torch.empty_like(input_)
 
-                dist.all_to_all_single(
-                    output, input_, group=group
-                )  # hn, shard_seqlen, bs, hd
+                if all_to_all_fn is None:
+                    dist.all_to_all_single(
+                        output, input_, group=group
+                    )  # hn, shard_seqlen, bs, hd
+                else:
+                    all_to_all_fn(output, input_)
 
                 output = torch.cat(
                     output.split(shard_hn), dim=1
@@ -177,7 +182,10 @@ class DistributedAutograd:
 
                 output = torch.empty_like(input_)
 
-                dist.all_to_all_single(output, input_, group=group)
+                if all_to_all_fn is None:
+                    dist.all_to_all_single(output, input_, group=group)
+                else:
+                    all_to_all_fn(output, input_)
 
                 output = output.transpose(
                     0, 2
@@ -193,15 +201,20 @@ class DistributedAutograd:
         @staticmethod
         def backward(
             ctx: Any, grad_output: Tensor
-        ) -> tuple[None, Tensor, None, None, None]:
+        ) -> tuple[None, Tensor, None, None, None, None]:
             if ctx.world_size == 1:
-                return None, grad_output, None, None, None
+                return None, grad_output, None, None, None, None
 
             # For backward pass, we swap scatter_dim and gather_dim
             output = DistributedAutograd.AllToAll4D.apply(
-                ctx.group, grad_output, ctx.world_size, ctx.gather_dim, ctx.scatter_dim
+                ctx.group,
+                grad_output,
+                ctx.world_size,
+                ctx.gather_dim,
+                ctx.scatter_dim,
+                ctx.all_to_all_fn,
             )
-            return None, output, None, None, None
+            return None, output, None, None, None, None
 
 
 class DeviceCommunicatorBase:
