@@ -29,6 +29,11 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.enable_purlin and cfg.enable_torchcomms:
+        raise ValueError(
+            "--enable-purlin and --enable-torchcomms are mutually exclusive."
+        )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (

@@ -44,6 +44,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
+from sglang.srt.distributed.device_communicators.torchcomms_adapter import (
+    TorchCommsCommunicator,
+)
 from sglang.srt.utils import is_shm_available
 
 try:
@@ -195,6 +198,7 @@ class GroupCoordinator:
         use_srt_custom_allreduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         enable_purlin: bool = False,
+        enable_torchcomms: bool = False,
         group_name: str | None = None,
     ):
         self.unique_name = _get_unique_name(group_name)
@@ -222,6 +226,11 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
         self.enable_purlin = enable_purlin
+        self.enable_torchcomms = enable_torchcomms
+        if self.enable_purlin and self.enable_torchcomms:
+            raise ValueError(
+                "--enable-purlin and --enable-torchcomms are mutually exclusive."
+            )
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
@@ -238,6 +247,7 @@ class GroupCoordinator:
                     device_group=self.device_group,
                     unique_name=self.unique_name,
                     enable_purlin=self.enable_purlin,
+                    enable_torchcomms=self.enable_torchcomms,
                 )
             else:
                 # For MPS and CPU, use the CPU communicator
@@ -910,14 +920,14 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self) -> None:
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
         if self.srt_custom_allreduce is not None:
             self.srt_custom_allreduce.close()
             self.srt_custom_allreduce = None
@@ -1371,6 +1381,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             local_rank=local_rank,
             torch_distributed_backend=torch_distributed_backend,
             enable_purlin=kwargs.get("enable_purlin", False),
+            enable_torchcomms=kwargs.get("enable_torchcomms", False),
             group_name=group_name,
         )
         ulysses_group = kwargs.get("ulysses_group", None)
@@ -1391,6 +1402,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
         self.ulysses_purlin_handle = None
+        self.ulysses_torchcomms_comm: TorchCommsCommunicator | None = None
         if (
             self.enable_purlin
             and self.ulysses_world_size > 1
@@ -1399,6 +1411,12 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             self.ulysses_purlin_handle = initialize_purlin_handle(
                 group=self.ulysses_group,
                 device=self.device,
+            )
+        if self.enable_torchcomms and self.ulysses_world_size > 1:
+            self.ulysses_torchcomms_comm = TorchCommsCommunicator(
+                ranks=torch.distributed.get_process_group_ranks(self.ulysses_group),
+                device=self.device,
+                name=f"{self.unique_name}_ulysses",
             )
 
     def ulysses_all_to_all_single(
@@ -1411,6 +1429,18 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         if self.ulysses_world_size == 1:
             output.copy_(input_)
             return None
+        if (
+            self.ulysses_torchcomms_comm is not None
+            and self.ulysses_torchcomms_comm.can_use(input_, output)
+            and input_.shape[0] == output.shape[0]
+            and input_.shape[0] % self.ulysses_world_size == 0
+        ):
+            return self.ulysses_torchcomms_comm.all_to_all(
+                output,
+                input_,
+                stream=stream,
+                async_op=async_op,
+            )
         if (
             can_use_purlin(self.ulysses_purlin_handle, input_, output)
             and input_.nbytes == output.nbytes
@@ -1439,6 +1469,23 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         if self.ulysses_world_size == 1:
             output.copy_(input_)
             return None
+
+        if (
+            self.ulysses_torchcomms_comm is not None
+            and self.ulysses_torchcomms_comm.can_use(input_, output)
+            and len(input_split_sizes) == self.ulysses_world_size
+            and len(output_split_sizes) == self.ulysses_world_size
+            and input_.shape[0] == sum(input_split_sizes)
+            and output.shape[0] == sum(output_split_sizes)
+        ):
+            return self.ulysses_torchcomms_comm.all_to_all(
+                output,
+                input_,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                stream=stream,
+                async_op=async_op,
+            )
 
         input_split_bytes = element_counts_to_bytes(input_split_sizes, input_)
         output_split_bytes = element_counts_to_bytes(output_split_sizes, input_)
@@ -1470,6 +1517,9 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         )
 
     def destroy(self) -> None:
+        if self.ulysses_torchcomms_comm is not None:
+            self.ulysses_torchcomms_comm.finalize()
+            self.ulysses_torchcomms_comm = None
         if self.ulysses_purlin_handle is not None:
             finalize_purlin_handle(self.ulysses_purlin_handle, self.device)
             self.ulysses_purlin_handle = None

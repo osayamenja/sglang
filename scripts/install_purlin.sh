@@ -12,12 +12,18 @@ readonly SGL_KERNEL_VERSION="0.4.6.post1"
 readonly TORCH_VERSION="2.13.0"
 readonly TORCHAUDIO_VERSION="2.11.0"
 readonly TORCHVISION_VERSION="0.28.0"
+readonly TORCHCOMMS_GIT_REPOSITORY="https://github.com/meta-pytorch/torchcomms.git"
+readonly TORCHCOMMS_GIT_REVISION="6288fc4d658f2b165623eb649c82149e82d2056b"
+readonly TORCHCOMMS_CUDA_ARCH_LIST="8.0;9.0;10.0a;10.3a"
+readonly TORCHCOMMS_CMAKE_CUDA_ARCHS="80;90;100a;103a"
+readonly TORCHCOMMS_NCCLX_GENCODE="-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100a,code=sm_100a -gencode=arch=compute_103a,code=sm_103a"
 readonly PYTHON_VERSION="3.12"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly REPO_ROOT
 readonly VENV_DIR="${REPO_ROOT}/.venv"
+readonly TORCHCOMMS_SOURCE_DIR="${REPO_ROOT}/.cache/torchcomms-${TORCHCOMMS_GIT_REVISION}-sm80-sm90-sm100a-sm103a"
 
 CURRENT_STEP="startup"
 CUDA_OVERRIDE=""
@@ -42,7 +48,8 @@ trap on_error ERR
 
 usage() {
     cat <<'EOF'
-Install this SGLang fork and Purlin into the repository's .venv.
+Install this SGLang fork, Purlin, and TorchComms/NCCLX into the repository's
+.venv.
 
 Usage:
   bash scripts/install_purlin.sh [options]
@@ -107,6 +114,17 @@ install_system_dependencies() {
     command -v ninja >/dev/null 2>&1 || missing+=(ninja-build)
     command -v protoc >/dev/null 2>&1 || missing+=(protobuf-compiler)
 
+    local package
+    for package in \
+        autoconf automake binutils bison flex git libibverbs-dev libnl-3-dev \
+        libnl-route-3-dev libnuma-dev libtool libunwind-dev make patch perl \
+        pkg-config; do
+        if ! dpkg-query -W -f='${Status}' "${package}" 2>/dev/null | \
+            grep -q '^install ok installed$'; then
+            missing+=("${package}")
+        fi
+    done
+
     if ((${#missing[@]} == 0)); then
         echo "Ubuntu build dependencies are already installed."
         return
@@ -132,7 +150,8 @@ else
     install_system_dependencies
 fi
 
-for command in cmake curl ninja protoc; do
+for command in autoconf automake bison cmake curl flex git libtoolize make \
+    ninja patch perl pkg-config protoc readelf; do
     command -v "${command}" >/dev/null 2>&1 || \
         die "${command} is required; install the system dependencies or omit --skip-system-deps"
 done
@@ -287,6 +306,55 @@ log "Installing datasets ${DATASETS_VERSION} with compatible fsspec ${FSSPEC_VER
     "datasets==${DATASETS_VERSION}" \
     "fsspec==${FSSPEC_VERSION}"
 
+prepare_torchcomms_source() {
+    local actual_revision
+
+    mkdir -p "$(dirname "${TORCHCOMMS_SOURCE_DIR}")"
+    if [[ -d "${TORCHCOMMS_SOURCE_DIR}/.git" ]]; then
+        actual_revision="$(git -C "${TORCHCOMMS_SOURCE_DIR}" rev-parse HEAD)"
+        [[ "${actual_revision}" == "${TORCHCOMMS_GIT_REVISION}" ]] || \
+            die "${TORCHCOMMS_SOURCE_DIR} is at ${actual_revision}, expected ${TORCHCOMMS_GIT_REVISION}"
+        return
+    fi
+    [[ ! -e "${TORCHCOMMS_SOURCE_DIR}" ]] || \
+        die "${TORCHCOMMS_SOURCE_DIR} exists but is not a TorchComms git checkout"
+
+    git init "${TORCHCOMMS_SOURCE_DIR}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" remote add origin \
+        "${TORCHCOMMS_GIT_REPOSITORY}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" fetch --depth 1 origin \
+        "${TORCHCOMMS_GIT_REVISION}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" checkout --detach FETCH_HEAD
+}
+
+CURRENT_STEP="TorchComms source checkout"
+log "Preparing TorchComms ${TORCHCOMMS_GIT_REVISION}"
+prepare_torchcomms_source
+
+CURRENT_STEP="TorchComms NCCLX source build"
+log "Building TorchComms/NCCLX for sm_80, sm_90, sm_100a, and sm_103a"
+"${UV_PIP[@]}" packaging pyyaml setuptools wheel
+CUDA_HOME="$(cd "$(dirname "$(readlink -f "$(command -v nvcc)")")/.." && pwd)"
+readonly CUDA_HOME
+(
+    export CMAKE_BUILD_PARALLEL_LEVEL="${TORCHCOMMS_BUILD_JOBS:-$(nproc)}"
+    export CMAKE_BUILD_TYPE=Release
+    export CUDA_HOME
+    export CUDAARCHS="${TORCHCOMMS_CMAKE_CUDA_ARCHS}"
+    export NCCL_BUILD_JOBS="${TORCHCOMMS_BUILD_JOBS:-$(nproc)}"
+    export NCCL_SKIP_CONDA_INSTALL=1
+    export NVCC_GENCODE="${TORCHCOMMS_NCCLX_GENCODE}"
+    export TORCH_CUDA_ARCH_LIST="${TORCHCOMMS_CUDA_ARCH_LIST}"
+    export USE_GLOO=OFF
+    export USE_NCCL=OFF
+    export USE_NCCLX=ON
+    export USE_TRANSPORT=OFF
+    export USE_TRANSPORT_CCA_HOOK=OFF
+    export USE_TRITON=OFF
+    "${UV_PIP[@]}" --reinstall --no-build-isolation --no-deps \
+        "${TORCHCOMMS_SOURCE_DIR}"
+)
+
 CURRENT_STEP="installation verification"
 log "Verifying the installation"
 EXPECTED_ACCELERATE_VERSION="${ACCELERATE_VERSION}" \
@@ -303,6 +371,7 @@ import purlin
 import pyarrow
 import sglang
 import torch
+import torchcomms
 from datasets import Dataset
 from diffusers.image_processor import VaeImageProcessor
 from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
@@ -338,6 +407,8 @@ if not torch_cuda or torch_cuda.split(".", 1)[0] != expected_cuda:
     raise SystemExit(
         f"Expected a CUDA {expected_cuda} PyTorch build, but torch.version.cuda is {torch_cuda!r}."
     )
+if not torchcomms.is_backend_built("ncclx"):
+    raise SystemExit("TorchComms was not built with its NCCLX backend.")
 
 dataset_probe = Dataset.from_dict({"value": [1]})
 if dataset_probe[0]["value"] != 1:
@@ -350,6 +421,11 @@ print(
 )
 print(f"purlin: {purlin_version}")
 print(f"torch: {torch.__version__} (CUDA {torch_cuda})")
+print(
+    "torchcomms: "
+    f"{importlib.metadata.version('torchcomms')} "
+    f"(backends: {', '.join(torchcomms.built_backends())})"
+)
 print(f"sglang: {importlib.metadata.version('sglang')}")
 print(f"diffusers: {importlib.metadata.version('diffusers')}")
 print(
@@ -362,10 +438,37 @@ PY
 SGLANG_HELP="$(${SGLANG_BIN} serve --help)"
 [[ "${SGLANG_HELP}" == *"--enable-purlin"* ]] || \
     die "sglang serve does not expose --enable-purlin"
+[[ "${SGLANG_HELP}" == *"--enable-torchcomms"* ]] || \
+    die "sglang serve does not expose --enable-torchcomms"
+
+CURRENT_STEP="TorchComms CUDA image verification"
+log "Verifying TorchComms CUDA images"
+mapfile -t TORCHCOMMS_LIBRARIES < <(
+    "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+
+import torchcomms
+
+for library in sorted(Path(torchcomms.__file__).parent.glob("*.so")):
+    print(library)
+PY
+)
+((${#TORCHCOMMS_LIBRARIES[@]} > 0)) || \
+    die "could not find the installed TorchComms shared libraries"
+CUOBJDUMP="${CUDA_HOME}/bin/cuobjdump"
+[[ -x "${CUOBJDUMP}" ]] || die "cuobjdump was not found at ${CUOBJDUMP}"
+TORCHCOMMS_CUDA_IMAGES="$(${CUOBJDUMP} --list-elf "${TORCHCOMMS_LIBRARIES[@]}")"
+for architecture in sm_80 sm_90 sm_100a sm_103a; do
+    grep -q "${architecture}" <<<"${TORCHCOMMS_CUDA_IMAGES}" || \
+        die "TorchComms is missing the required ${architecture} CUDA image"
+done
+echo "Verified TorchComms CUDA images: sm_80, sm_90, sm_100a, sm_103a"
 
 log "Installation complete"
 printf 'Environment: %s\n' "${VENV_DIR}"
 printf 'CUDA toolkit: %s\n' "${CUDA_RELEASE}"
 printf 'Purlin: %s\n' "${PURLIN_VERSION}"
+printf 'TorchComms revision: %s\n' "${TORCHCOMMS_GIT_REVISION}"
+printf 'TorchComms CUDA images: %s\n' "sm_80, sm_90, sm_100a, sm_103a"
 printf 'Datasets: %s\n' "${DATASETS_VERSION}"
 printf '\nActivate it with:\n  source %q\n' "${VENV_DIR}/bin/activate"
