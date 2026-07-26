@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.distributed.device_communicators import torchcomms_adapter
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeComm:

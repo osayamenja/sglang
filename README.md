@@ -31,10 +31,11 @@ This fork is rebased on upstream SGLang
 (2026-09-01). At that base commit, SGLang's version resolver reports
 `0.5.19.dev806+g0f18d389b` (based on release tag `v0.5.18`).
 
-This fork integrates [Purlin](https://pypi.org/project/purlin/) and
-[torchcomms](https://github.com/meta-pytorch/torchcomms) as SGLang
-communication backends. The installer supports Ubuntu with a CUDA 12.9 or CUDA
-13 toolkit and installs the tested `purlin==0.6.0` release plus a pinned
+This fork integrates [Purlin](https://pypi.org/project/purlin/),
+[torchcomms](https://github.com/meta-pytorch/torchcomms), and
+[MSCCL++](https://github.com/microsoft/mscclpp) as SGLang communication
+backends. The installer supports Ubuntu with a CUDA 12.9 or CUDA 13 toolkit and
+installs the tested `purlin==0.6.0`, MSCCL++ `sglang-v0.9.1`, and a pinned
 TorchComms/NCCLX source revision.
 
 From the repository root, run:
@@ -44,15 +45,16 @@ bash scripts/install_purlin.sh
 ```
 
 The script installs the required Ubuntu build packages, Rust, `uv`, a managed
-Python 3.12 environment in `.venv`, Purlin, TorchComms/NCCLX, the matching CUDA
-dependencies, and the `sglang[diffusion]` dependencies needed for image and
-video generation. It detects CUDA from `nvcc`. To require a particular toolkit
-version, use `--cuda 12` or `--cuda 13`; the selected `nvcc` must match.
+Python 3.12 environment in `.venv`, Purlin, torchcomms, MSCCL++, the matching
+CUDA dependencies, and the `sglang[diffusion]` dependencies needed for image
+and video generation. It detects CUDA from `nvcc`. To require a particular
+toolkit version, use `--cuda 12` or `--cuda 13`; the selected `nvcc` must
+match.
 
 TorchComms is built from source against SGLang's pinned PyTorch version. The
-NCCLX and Torch extension builds include A100 (`sm_80`), B200 (`sm_100`), and
-B300 (`sm_103`) device images so the same environment can be used for baseline
-experiments on Ampere and Blackwell systems.
+NCCLX and Torch extension builds include A100 (`sm_80`), H100 (`sm_90`), B200
+(`sm_100a`), and B300 (`sm_103a`) device images so the same environment can be
+used for baseline experiments on Ampere, Hopper, and Blackwell systems.
 
 After installation, activate the environment and verify both the core and
 diffusion CLIs:
@@ -63,9 +65,10 @@ sglang version
 sglang generate --help
 ```
 
-Enable a communication backend with `sglang serve --enable-purlin ...` or
-`sglang serve --enable-torchcomms ...`. The two flags are mutually exclusive.
-Run `bash scripts/install_purlin.sh --help` for all installer options.
+Enable a communication backend with `sglang serve --enable-purlin ...`,
+`sglang serve --enable-torchcomms ...`, or
+`sglang serve --enable-mscclpp ...`. These flags are mutually exclusive. Run
+`bash scripts/install_purlin.sh --help` for all installer options.
 
 ---
 

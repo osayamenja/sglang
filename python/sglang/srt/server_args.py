@@ -1997,7 +1997,7 @@ class ServerArgs:
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for supported all-reduce and all-gather calls and fall back to NCCL.",
         NS("exec.comm"),
     ] = False
     enable_purlin: A[

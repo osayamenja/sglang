@@ -12,6 +12,7 @@ readonly SGL_KERNEL_VERSION="0.4.6.post1"
 readonly TORCH_VERSION="2.13.0"
 readonly TORCHAUDIO_VERSION="2.11.0"
 readonly TORCHVISION_VERSION="0.28.0"
+readonly MSCCLPP_VERSION="sglang-v0.9.1"
 readonly TORCHCOMMS_GIT_REPOSITORY="https://github.com/meta-pytorch/torchcomms.git"
 readonly TORCHCOMMS_GIT_REVISION="6288fc4d658f2b165623eb649c82149e82d2056b"
 readonly TORCHCOMMS_CUDA_ARCH_LIST="8.0;9.0;10.0a;10.3a"
@@ -48,7 +49,7 @@ trap on_error ERR
 
 usage() {
     cat <<'EOF'
-Install this SGLang fork, Purlin, and TorchComms/NCCLX into the repository's
+Install this SGLang fork and its communication backends into the repository's
 .venv.
 
 Usage:
@@ -111,8 +112,13 @@ install_system_dependencies() {
     fi
     command -v cmake >/dev/null 2>&1 || missing+=(cmake)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v git >/dev/null 2>&1 || missing+=(git)
     command -v ninja >/dev/null 2>&1 || missing+=(ninja-build)
     command -v protoc >/dev/null 2>&1 || missing+=(protobuf-compiler)
+    if ! dpkg-query -W -f='${Status}' libnuma-dev 2>/dev/null | \
+        grep -q '^install ok installed$'; then
+        missing+=(libnuma-dev)
+    fi
 
     local package
     for package in \
@@ -355,11 +361,28 @@ readonly CUDA_HOME
         "${TORCHCOMMS_SOURCE_DIR}"
 )
 
+CURRENT_STEP="MSCCL++ installation"
+log "Installing MSCCL++ ${MSCCLPP_VERSION}"
+MSCCLPP_SOURCE_DIR="$(mktemp -d -t sglang-mscclpp.XXXXXX)"
+cleanup_mscclpp_source() {
+    if [[ -n "${MSCCLPP_SOURCE_DIR:-}" && -d "${MSCCLPP_SOURCE_DIR}" ]]; then
+        rm -rf -- "${MSCCLPP_SOURCE_DIR}"
+    fi
+}
+trap cleanup_mscclpp_source EXIT
+git clone --depth 1 --branch "${MSCCLPP_VERSION}" \
+    https://github.com/microsoft/mscclpp.git "${MSCCLPP_SOURCE_DIR}"
+CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+    "${UV_PIP[@]}" "${MSCCLPP_SOURCE_DIR}[cuda${CUDA_MAJOR}]"
+cleanup_mscclpp_source
+trap - EXIT
+
 CURRENT_STEP="installation verification"
 log "Verifying the installation"
 EXPECTED_ACCELERATE_VERSION="${ACCELERATE_VERSION}" \
 EXPECTED_CUDA_MAJOR="${CUDA_MAJOR}" EXPECTED_DATASETS_VERSION="${DATASETS_VERSION}" \
 EXPECTED_FSSPEC_VERSION="${FSSPEC_VERSION}" EXPECTED_PURLIN_VERSION="${PURLIN_VERSION}" \
+EXPECTED_MSCCLPP_VERSION="${MSCCLPP_VERSION#sglang-v}" \
     "${PYTHON_BIN}" <<'PY'
 import importlib.metadata
 import os
@@ -367,6 +390,7 @@ import os
 import accelerate
 import datasets
 import fsspec
+import mscclpp
 import purlin
 import pyarrow
 import sglang
@@ -380,16 +404,22 @@ expected_accelerate = os.environ["EXPECTED_ACCELERATE_VERSION"]
 expected_cuda = os.environ["EXPECTED_CUDA_MAJOR"]
 expected_datasets = os.environ["EXPECTED_DATASETS_VERSION"]
 expected_fsspec = os.environ["EXPECTED_FSSPEC_VERSION"]
+expected_mscclpp = os.environ["EXPECTED_MSCCLPP_VERSION"]
 expected_purlin = os.environ["EXPECTED_PURLIN_VERSION"]
 accelerate_version = importlib.metadata.version("accelerate")
 datasets_version = importlib.metadata.version("datasets")
 fsspec_version = importlib.metadata.version("fsspec")
+mscclpp_version = importlib.metadata.version("mscclpp")
 purlin_version = importlib.metadata.version("purlin")
 torch_cuda = torch.version.cuda
 
 if accelerate_version != expected_accelerate:
     raise SystemExit(
         f"Expected accelerate {expected_accelerate}, but found {accelerate_version}."
+    )
+if mscclpp_version != expected_mscclpp:
+    raise SystemExit(
+        f"Expected mscclpp {expected_mscclpp}, but found {mscclpp_version}."
     )
 if purlin_version != expected_purlin:
     raise SystemExit(
@@ -419,6 +449,7 @@ print(
     f"datasets: {datasets_version} "
     f"(fsspec {fsspec_version}, PyArrow {pyarrow.__version__})"
 )
+print(f"mscclpp: {mscclpp_version}")
 print(f"purlin: {purlin_version}")
 print(f"torch: {torch.__version__} (CUDA {torch_cuda})")
 print(
@@ -440,6 +471,8 @@ SGLANG_HELP="$(${SGLANG_BIN} serve --help)"
     die "sglang serve does not expose --enable-purlin"
 [[ "${SGLANG_HELP}" == *"--enable-torchcomms"* ]] || \
     die "sglang serve does not expose --enable-torchcomms"
+[[ "${SGLANG_HELP}" == *"--enable-mscclpp"* ]] || \
+    die "sglang serve does not expose --enable-mscclpp"
 
 CURRENT_STEP="TorchComms CUDA image verification"
 log "Verifying TorchComms CUDA images"
@@ -467,6 +500,7 @@ echo "Verified TorchComms CUDA images: sm_80, sm_90, sm_100a, sm_103a"
 log "Installation complete"
 printf 'Environment: %s\n' "${VENV_DIR}"
 printf 'CUDA toolkit: %s\n' "${CUDA_RELEASE}"
+printf 'MSCCL++: %s\n' "${MSCCLPP_VERSION}"
 printf 'Purlin: %s\n' "${PURLIN_VERSION}"
 printf 'TorchComms revision: %s\n' "${TORCHCOMMS_GIT_REVISION}"
 printf 'TorchComms CUDA images: %s\n' "sm_80, sm_90, sm_100a, sm_103a"

@@ -434,6 +434,21 @@ class GroupCoordinator:
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
+        communication_backends = [
+            name
+            for name, enabled in (
+                ("MSCCL++", use_pymscclpp),
+                ("Purlin", _ENABLE_PURLIN),
+                ("torchcomms", _ENABLE_TORCHCOMMS),
+            )
+            if enabled
+        ]
+        if len(communication_backends) > 1:
+            raise ValueError(
+                f"{', '.join(communication_backends)} communication backends "
+                "are mutually exclusive."
+            )
+
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
@@ -545,10 +560,6 @@ class GroupCoordinator:
 
         self.purlin: Optional[Any] = None
         self.purlin_handle: Optional[Any] = None
-        if _ENABLE_PURLIN and _ENABLE_TORCHCOMMS:
-            raise ValueError(
-                "--enable-purlin and --enable-torchcomms are mutually exclusive."
-            )
         self.enable_purlin = _ENABLE_PURLIN and is_cuda() and self.world_size > 1
         if self.enable_purlin:
             try:
@@ -1405,6 +1416,13 @@ class GroupCoordinator:
             and output.numel() == input.numel() * self.world_size
         ):
             self.torchcomms_comm.all_gather(output, input)
+            return
+
+        pymscclpp_comm = self.pymscclpp_comm
+        if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
+            output, input
+        ):
+            pymscclpp_comm.all_gather(output, input)
             return
 
         if (

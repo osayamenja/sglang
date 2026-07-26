@@ -1,17 +1,20 @@
-## MSCCL++ All-Reduce Benchmark
+## MSCCL++ Collectives
 
-[MSCCL++](https://github.com/microsoft/mscclpp) is a GPU-driven communication library that can replace NCCL for all-reduce operations. It supports CUDA graph capture and is optimized for small-to-medium message sizes commonly seen in tensor-parallel inference.
+[MSCCL++](https://github.com/microsoft/mscclpp) is a GPU-driven communication library that can replace NCCL for selected all-reduce and all-gather operations. It supports CUDA graph capture and is optimized for small-to-medium message sizes commonly seen in tensor-parallel inference.
 
-Currently supported configurations: **TP=8** (single-node) and **TP=16** (two-node).
+Native all-reduce and equal-size all-gather are supported for single-node
+communicator sizes **2**, **4**, and **8**. Multi-node all-reduce remains
+supported for communicator sizes **16** and **32**. Unsupported operations,
+layouts, dtypes, sizes, and topologies fall back to the existing backend.
 
 ### Prerequisites
 
 1. If you use the default SGLang Docker image build from `docker/Dockerfile`, [MSCCL++](https://github.com/microsoft/mscclpp) is already installed by default.
-2. If you are not using that Docker image (or want to install manually), install [MSCCL++](https://github.com/microsoft/mscclpp) from source (requires CMake and a CUDA toolkit):
+2. If you are not using that Docker image (or want to install manually), install the pinned [MSCCL++](https://github.com/microsoft/mscclpp) source (requires CMake and a CUDA toolkit):
     ```bash
-    git clone https://github.com/microsoft/mscclpp.git
-    cd mscclpp && mkdir build && cd build
-    cmake .. && make -j && pip install ..
+    git clone --depth 1 --branch sglang-v0.9.1 \
+        https://github.com/microsoft/mscclpp.git
+    pip install "./mscclpp[cuda12]"  # Use cuda13 for a CUDA 13 toolkit.
     ```
 3. Ensure `mscclpp` is importable in your Python environment before running the benchmark or using MSCCL++ for inference.
 
@@ -43,7 +46,8 @@ torchrun --nproc_per_node 8 \
 
 ### Inference with MSCCL++
 
-Use the `--enable-mscclpp` flag to select MSCCL++ as the all-reduce backend during CUDA-graph-captured inference:
+Use the `--enable-mscclpp` flag to select MSCCL++ for eligible all-reduce and
+all-gather calls during CUDA-graph-captured inference:
 
 ```bash
 python -m sglang.launch_server \
@@ -53,3 +57,10 @@ python -m sglang.launch_server \
 ```
 
 > **Note:** MSCCL++ performs auto-tuning on first initialization, which may add a few seconds to startup time. The tuned configurations are cached for the lifetime of the process.
+
+To smoke-test both collectives:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+    test/manual/distributed/test_mscclpp.py
+```
