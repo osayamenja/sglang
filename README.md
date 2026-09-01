@@ -27,8 +27,8 @@
 ## Install This Fork
 
 This fork integrates [Purlin](https://pypi.org/project/purlin/) as an SGLang
-communication backend. The installer supports Ubuntu with a CUDA 12 or CUDA 13
-toolkit and installs the tested `purlin==0.6.0` release.
+communication backend. The installer supports Ubuntu with a CUDA 12.9 or CUDA
+13 toolkit and installs the tested `purlin==0.6.0` release.
 
 From the repository root, run:
 

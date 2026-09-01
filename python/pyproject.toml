@@ -106,22 +106,6 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
-cuda12 = [
-  "cuda-python>=12.9,<13.0",
-  "flashinfer_python[cu12]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
-  "nvidia-cutlass-dsl==4.5.2",
-  "sgl-deep-gemm==0.1.4+cu129",
-  "sglang-kernel==0.4.4+cu129",
-]
-
-cuda13 = [
-  "cuda-python>=13.0",
-  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
-  "sgl-deep-gemm==0.1.4",
-  "sglang-kernel==0.4.4",
-]
-
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [

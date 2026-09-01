@@ -6,6 +6,12 @@ readonly PURLIN_VERSION="0.6.0"
 readonly ACCELERATE_VERSION="1.12.0"
 readonly DATASETS_VERSION="5.0.1"
 readonly FSSPEC_VERSION="2026.6.0"
+readonly SGL_DEEP_EP_VERSION="0.1.2"
+readonly SGL_DEEP_GEMM_VERSION="0.1.7"
+readonly SGL_KERNEL_VERSION="0.4.6.post1"
+readonly TORCH_VERSION="2.13.0"
+readonly TORCHAUDIO_VERSION="2.11.0"
+readonly TORCHVISION_VERSION="0.28.0"
 readonly PYTHON_VERSION="3.12"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
@@ -42,7 +48,7 @@ Usage:
   bash scripts/install_purlin.sh [options]
 
 Options:
-  --cuda 12|13          Require a specific CUDA toolkit major version.
+  --cuda 12|13          Require CUDA 12.9 or a CUDA 13 toolkit.
   --skip-system-deps    Do not install Ubuntu packages with apt-get.
   -h, --help            Show this help message.
 
@@ -137,15 +143,19 @@ fi
 CURRENT_STEP="CUDA toolkit detection"
 log "Detecting the CUDA toolkit"
 command -v nvcc >/dev/null 2>&1 || \
-    die "nvcc was not found in PATH; install or select a CUDA 12 or 13 toolkit"
+    die "nvcc was not found in PATH; install or select CUDA 12.9 or CUDA 13"
 NVCC_OUTPUT="$(nvcc --version)"
 CUDA_RELEASE="$(sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1.\2/p' <<<"${NVCC_OUTPUT}" | head -n1)"
 [[ -n "${CUDA_RELEASE}" ]] || die "could not parse the CUDA version from nvcc --version"
 CUDA_MAJOR="${CUDA_RELEASE%%.*}"
 case "${CUDA_MAJOR}" in
     12 | 13) ;;
-    *) die "CUDA ${CUDA_RELEASE} is unsupported; CUDA 12 or 13 is required" ;;
+    *) die "CUDA ${CUDA_RELEASE} is unsupported; CUDA 12.9 or CUDA 13 is required" ;;
 esac
+CUDA_MINOR="${CUDA_RELEASE#*.}"
+if [[ "${CUDA_MAJOR}" == "12" ]] && ((10#${CUDA_MINOR} < 9)); then
+    die "CUDA ${CUDA_RELEASE} is unsupported; CUDA 12.9 or CUDA 13 is required"
+fi
 if [[ -n "${CUDA_OVERRIDE}" && "${CUDA_OVERRIDE}" != "${CUDA_MAJOR}" ]]; then
     die "--cuda ${CUDA_OVERRIDE} does not match nvcc (${CUDA_RELEASE}); select the intended nvcc through PATH"
 fi
@@ -196,17 +206,68 @@ log "Installing Purlin ${PURLIN_VERSION}"
 "${UV_PIP[@]}" "purlin==${PURLIN_VERSION}"
 
 install_cuda12_dependencies() {
-    "${UV_PIP[@]}" "flashinfer_python[cu12]==0.6.12"
+    local machine_arch
+    local -a cuda13_packages=()
+    local -a sglang_requirements=()
+
+    machine_arch="$(uname -m)"
+
+    # Install CUDA 12.9 variants first. Their local-version suffixes satisfy
+    # the corresponding public-version pins in pyproject.toml.
     "${UV_PIP[@]}" --reinstall \
         --default-index https://download.pytorch.org/whl/cu129 \
-        "torch==2.11.0" "torchaudio==2.11.0" torchvision
-    "${UV_PIP[@]}" --reinstall \
-        --default-index https://docs.sglang.ai/whl/cu129/ \
-        "sglang-kernel==0.4.4+cu129"
+        "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}"
+    "${UV_PIP[@]}" --reinstall --no-deps \
+        "https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_${machine_arch}.whl"
+    "${UV_PIP[@]}" --reinstall --no-deps \
+        "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_${machine_arch}.whl"
     "${UV_PIP[@]}" --reinstall --no-deps \
         --default-index https://docs.sglang.ai/whl/cu129/ \
-        "sgl-deep-gemm==0.1.4+cu129"
-    "${UV_PIP[@]}" --editable "${REPO_ROOT}/python[cuda12,diffusion]"
+        "sgl-deep-ep==${SGL_DEEP_EP_VERSION}+cu129"
+
+    # Resolve the current upstream dependency set after changing only the
+    # three CUDA-major-specific requirements. Keeping this transformation in
+    # memory avoids modifying the checkout during installation.
+    mapfile -t sglang_requirements < <(
+        PYPROJECT_PATH="${REPO_ROOT}/python/pyproject.toml" \
+            "${PYTHON_BIN}" <<'PY'
+import os
+import tomllib
+
+with open(os.environ["PYPROJECT_PATH"], "rb") as file:
+    project = tomllib.load(file)["project"]
+
+requirements = project["dependencies"] + project["optional-dependencies"]["diffusion"]
+for requirement in requirements:
+    requirement = requirement.replace("cuda-python>=13.0", "cuda-python>=12.9,<13.0")
+    requirement = requirement.replace("flashinfer_python[cu13]", "flashinfer_python[cu12]")
+    requirement = requirement.replace("nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl")
+    print(requirement)
+PY
+    )
+    ((${#sglang_requirements[@]} > 0)) || die "could not read SGLang dependencies"
+    "${UV_PIP[@]}" --extra-index-url https://download.pytorch.org/whl/cu129 \
+        "${sglang_requirements[@]}"
+
+    # Some extras publish helper distributions with a -cu13 suffix. They are
+    # not usable in a CUDA 12 environment and mirror upstream's Docker cleanup.
+    mapfile -t cuda13_packages < <(
+        "${PYTHON_BIN}" <<'PY'
+import importlib.metadata
+
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name", "")
+    if name.lower().endswith("-cu13"):
+        print(name)
+PY
+    )
+    if ((${#cuda13_packages[@]} > 0)); then
+        "${UV_BIN}" pip uninstall --python "${PYTHON_BIN}" \
+            "${cuda13_packages[@]}"
+    fi
+
+    "${UV_PIP[@]}" --no-deps --editable "${REPO_ROOT}/python[diffusion]"
 }
 
 CURRENT_STEP="SGLang CUDA ${CUDA_MAJOR} installation"
@@ -214,7 +275,7 @@ log "Installing this SGLang checkout for CUDA ${CUDA_MAJOR}"
 if [[ "${CUDA_MAJOR}" == "12" ]]; then
     install_cuda12_dependencies
 else
-    "${UV_PIP[@]}" --editable "${REPO_ROOT}/python[cuda13,diffusion]"
+    "${UV_PIP[@]}" --editable "${REPO_ROOT}/python[diffusion]"
 fi
 
 CURRENT_STEP="Hugging Face datasets compatibility"
