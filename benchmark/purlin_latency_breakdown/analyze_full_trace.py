@@ -13,15 +13,18 @@ concurrency, benchmark request timestamps are converted to the Nsight session
 clock. In both modes, each request uses only the critical timeline for its
 returned DP rank.
 
-For the requested two-bucket model:
+The public model has three additive buckets:
 
 * compute is the union of non-communication kernel intervals on the selected
   rank for a scheduler step;
-* communication is the step's kernel wall span minus compute.
+* communication is communication-kernel-active time not overlapping compute;
+* uncovered is time inside the selected step's first-to-last-kernel span when
+  no classified GPU kernel is active.
 
-The second definition deliberately folds collective kernels, collective waits,
-and communication-induced synchronization gaps into one bucket and guarantees
-``total = compute + communication`` for every step.
+Small cross-stream timestamp overlap is assigned to compute, while raw
+communication-kernel activity and overlap remain available in diagnostics.
+This guarantees ``total = compute + communication + uncovered`` at every
+aggregation level without claiming that uncovered time is communication.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from pathlib import Path
 from typing import Iterable
 
 MEASUREMENT_MARKER_PREFIX = "sglang.measurement:"
+BATCH_PHASE_MARKER_PREFIX = "sglang.batch_phase:"
 COMMUNICATION_KERNEL_NAMES = frozenset(
     {
         "all_reduce_one_shot_push_kernel",
@@ -64,6 +68,7 @@ COLLECTIVE_NAME_WARNING_TERMS = (
 # topologies while still rejecting meaningful concurrent execution. Keep it a
 # CLI option so a hardware-specific calibration can tighten it.
 DEFAULT_COMMUNICATION_COMPUTE_OVERLAP_TOLERANCE_NS = 25_000
+SchedulerRange = tuple[int, int, int, str]
 
 
 @dataclass
@@ -74,6 +79,7 @@ class RankStep:
     total: int
     compute: int
     communication: int
+    uncovered: int
     communication_kernel_active: int
     communication_compute_overlap: int
     kernel_coverage: int
@@ -82,6 +88,7 @@ class RankStep:
     stream_count: int
     compute_intervals: tuple[tuple[int, int], ...]
     communication_intervals: tuple[tuple[int, int], ...]
+    phase: str
 
 
 @dataclass
@@ -220,7 +227,7 @@ def create_analysis_indexes(connection: sqlite3.Connection) -> None:
 
 def scheduler_ranges_by_pid(
     connection: sqlite3.Connection,
-) -> dict[int, list[tuple[int, int, int]]]:
+) -> dict[int, list[SchedulerRange]]:
     rows = connection.execute("""
         SELECT
             events.start,
@@ -239,9 +246,63 @@ def scheduler_ranges_by_pid(
             "SGLANG_ENABLE_NVTX_SCHEDULER=1."
         )
 
-    ranges_by_pid: dict[int, list[tuple[int, int, int]]] = collections.defaultdict(list)
+    phase_rows = connection.execute(
+        """
+        SELECT
+            events.start,
+            events.globalTid,
+            (events.globalTid >> 24) & 0x00FFFFFF AS pid,
+            coalesce(strings.value, events.text) AS marker_text
+        FROM NVTX_EVENTS AS events
+        LEFT JOIN StringIds AS strings ON strings.id = events.textId
+        WHERE coalesce(strings.value, events.text) LIKE ?
+        ORDER BY pid, events.start
+        """,
+        (BATCH_PHASE_MARKER_PREFIX + "%",),
+    ).fetchall()
+    if not phase_rows:
+        raise ValueError(
+            f"No {BATCH_PHASE_MARKER_PREFIX} markers found. Rerun the trace "
+            "with a server that emits explicit scheduler batch phases."
+        )
+
+    markers_by_tid: dict[int, list[tuple[int, str]]] = collections.defaultdict(list)
+    for timestamp, global_tid, pid, marker_text in phase_rows:
+        phase = marker_text.removeprefix(BATCH_PHASE_MARKER_PREFIX)
+        if phase not in ("prefill", "decode", "idle"):
+            raise ValueError(
+                f"Scheduler pid {pid} emitted invalid batch phase {phase!r}"
+            )
+        markers_by_tid[int(global_tid)].append((int(timestamp), phase))
+
+    ranges_by_pid: dict[int, list[SchedulerRange]] = collections.defaultdict(list)
+    used_markers: set[tuple[int, int]] = set()
     for start, end, global_tid, pid in rows:
-        ranges_by_pid[pid].append((start, end, global_tid))
+        matches = [
+            (timestamp, phase)
+            for timestamp, phase in markers_by_tid.get(int(global_tid), [])
+            if start <= timestamp <= end
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected one scheduler batch-phase marker inside pid {pid} "
+                f"range [{start}, {end}], found {matches}"
+            )
+        timestamp, phase = matches[0]
+        used_markers.add((int(global_tid), timestamp))
+        ranges_by_pid[pid].append((start, end, global_tid, phase))
+
+    all_markers = {
+        (global_tid, timestamp)
+        for global_tid, markers in markers_by_tid.items()
+        for timestamp, _ in markers
+    }
+    unmatched_markers = all_markers - used_markers
+    if unmatched_markers:
+        raise ValueError(
+            "Scheduler batch-phase markers were not contained by complete "
+            f"scheduler.run_batch ranges: {sorted(unmatched_markers)}"
+        )
     return dict(sorted(ranges_by_pid.items()))
 
 
@@ -414,23 +475,23 @@ def load_measurement_topology(
 
 
 def filter_scheduler_ranges_to_measurement(
-    ranges_by_pid: dict[int, list[tuple[int, int, int]]],
+    ranges_by_pid: dict[int, list[SchedulerRange]],
     topology: dict[int, SchedulerTopology],
-) -> tuple[dict[int, list[tuple[int, int, int]]], dict[int, dict[str, int]]]:
+) -> tuple[dict[int, list[SchedulerRange]], dict[int, dict[str, int]]]:
     topology_by_pid = {item.pid: item for item in topology.values()}
-    ranges_by_device: dict[int, list[tuple[int, int, int]]] = {}
+    ranges_by_device: dict[int, list[SchedulerRange]] = {}
     validation: dict[int, dict[str, int]] = {}
     for pid, ranges in ranges_by_pid.items():
         item = topology_by_pid[pid]
-        measured: list[tuple[int, int, int]] = []
+        measured: list[SchedulerRange] = []
         prefix = suffix = 0
-        for start, end, global_tid in ranges:
+        for start, end, global_tid, phase in ranges:
             if end <= item.begin:
                 prefix += 1
             elif start >= item.end:
                 suffix += 1
             elif start >= item.begin and end <= item.end:
-                measured.append((start, end, global_tid))
+                measured.append((start, end, global_tid, phase))
             else:
                 raise ValueError(
                     f"scheduler.run_batch range [{start}, {end}] for pid {pid} "
@@ -471,12 +532,12 @@ def is_communication_kernel(name: str, extra_names: frozenset[str]) -> bool:
 def load_rank_step(
     connection: sqlite3.Connection,
     device: int,
-    scheduler_range: tuple[int, int, int],
+    scheduler_range: SchedulerRange,
     extra_communication_kernel_names: frozenset[str],
     communication_kernel_totals: dict[str, list[int]],
     overlap_tolerance_ns: int = (DEFAULT_COMMUNICATION_COMPUTE_OVERLAP_TOLERANCE_NS),
 ) -> RankStep:
-    range_start, range_end, global_tid = scheduler_range
+    range_start, range_end, global_tid, phase = scheduler_range
     rows = connection.execute(
         """
         SELECT
@@ -541,9 +602,17 @@ def load_rank_step(
             f"range [{range_start}, {range_end}]"
         ),
     )
-    communication = total - compute
-    if total != compute + communication:
-        raise AssertionError("Internal two-bucket arithmetic invariant failed")
+    # Attribute tolerated overlap to compute exactly once. Communication is
+    # therefore exclusive communication-kernel activity, while the raw active
+    # duration remains available in ``communication_kernel_active``.
+    communication = communication_active - communication_compute_overlap
+    uncovered = total - coverage
+    if communication < 0 or uncovered < 0:
+        raise AssertionError(
+            "Internal kernel interval accounting produced a negative bucket"
+        )
+    if total != compute + communication + uncovered:
+        raise AssertionError("Internal three-bucket arithmetic invariant failed")
     return RankStep(
         device=device,
         start=start,
@@ -551,6 +620,7 @@ def load_rank_step(
         total=total,
         compute=compute,
         communication=communication,
+        uncovered=uncovered,
         communication_kernel_active=communication_active,
         communication_compute_overlap=communication_compute_overlap,
         kernel_coverage=coverage,
@@ -559,27 +629,19 @@ def load_rank_step(
         stream_count=len(streams),
         compute_intervals=compute_intervals,
         communication_intervals=communication_intervals,
+        phase=phase,
     )
 
 
-def build_step_groups(
-    rank_steps: dict[int, list[RankStep]], graph_fraction_threshold: float
-) -> list[StepGroup]:
+def build_step_groups(rank_steps: dict[int, list[RankStep]]) -> list[StepGroup]:
     step_count = next(iter({len(steps) for steps in rank_steps.values()}))
     step_groups: list[StepGroup] = []
-    rank_count = len(rank_steps)
     for index in range(step_count):
         candidates = [steps[index] for steps in rank_steps.values()]
-        decode_votes = sum(
-            step.graph_kernel_count / step.kernel_count >= graph_fraction_threshold
-            for step in candidates
-        )
-        if decode_votes not in (0, rank_count):
-            raise ValueError(
-                f"Ranks disagree on phase for scheduler step {index}: "
-                f"{decode_votes}/{rank_count} classify as decode"
-            )
-        phase = "decode" if decode_votes == rank_count else "prefill"
+        active_phases = {step.phase for step in candidates if step.phase != "idle"}
+        if not active_phases:
+            raise ValueError(f"Scheduler step {index} is idle on every rank")
+        phase = next(iter(active_phases)) if len(active_phases) == 1 else "mixed"
         step_groups.append(
             StepGroup(
                 index=index,
@@ -589,6 +651,48 @@ def build_step_groups(
             )
         )
     return step_groups
+
+
+def validate_prefill_cuda_graph_execution(
+    rank_steps: dict[int, list[RankStep]], *, required: bool
+) -> dict[int, dict[str, int]]:
+    """Audit whether active prefill steps actually replayed a CUDA graph."""
+
+    audit: dict[int, dict[str, int]] = {}
+    eager_steps: list[tuple[int, int]] = []
+    for device, steps in sorted(rank_steps.items()):
+        active_prefill = [
+            (index, step) for index, step in enumerate(steps) if step.phase == "prefill"
+        ]
+        graphed = [
+            (index, step)
+            for index, step in active_prefill
+            if step.graph_kernel_count > 0
+        ]
+        eager = [
+            (index, step)
+            for index, step in active_prefill
+            if step.graph_kernel_count == 0
+        ]
+        eager_steps.extend((device, index) for index, _ in eager)
+        audit[device] = {
+            "active_prefill_steps": len(active_prefill),
+            "graphed_prefill_steps": len(graphed),
+            "eager_prefill_steps": len(eager),
+        }
+
+    active_count = sum(item["active_prefill_steps"] for item in audit.values())
+    if required and active_count == 0:
+        raise ValueError(
+            "Prefill CUDA graph execution was required, but the measured "
+            "interval contains no active prefill steps"
+        )
+    if required and eager_steps:
+        raise ValueError(
+            "Prefill CUDA graph execution was required, but measured active "
+            f"prefill steps ran eagerly: {eager_steps}"
+        )
+    return audit
 
 
 def select_critical_step(
@@ -605,9 +709,16 @@ def select_critical_step(
         raise ValueError(
             f"Scheduler step {group.index} has no device for attention-DP rank {dp_rank}"
         )
+    active_phases = {step.phase for step in candidates if step.phase != "idle"}
+    if len(active_phases) > 1:
+        raise ValueError(
+            f"Scheduler step {group.index} has conflicting phases within "
+            f"attention-DP rank {dp_rank}: {sorted(active_phases)}"
+        )
+    phase = next(iter(active_phases)) if active_phases else "idle"
     return CriticalStep(
         index=group.index,
-        phase=group.phase,
+        phase=phase,
         rank=max(candidates, key=lambda step: step.total),
         all_rank_longest=group.all_rank_longest,
     )
@@ -671,42 +782,43 @@ def component_totals(steps: Iterable[CriticalStep]) -> dict[str, float]:
     total_ns = sum(step.rank.total for step in steps)
     compute_ns = sum(step.rank.compute for step in steps)
     communication_ns = sum(step.rank.communication for step in steps)
-    if total_ns != compute_ns + communication_ns:
+    uncovered_ns = sum(step.rank.uncovered for step in steps)
+    if total_ns != compute_ns + communication_ns + uncovered_ns:
         raise AssertionError(
-            "Request components violate total = compute + communication"
+            "Request components violate total = compute + communication + uncovered"
         )
 
     ns_to_ms = 1e-6
     compute_ms = compute_ns * ns_to_ms
     communication_ms = communication_ns * ns_to_ms
+    uncovered_ms = uncovered_ns * ns_to_ms
     result = {
         # Build total from the converted buckets as well, so serialized
         # request values retain the additive invariant bit-for-bit.
-        "total": compute_ms + communication_ms,
+        "total": sum((compute_ms, communication_ms, uncovered_ms)),
         "compute": compute_ms,
         "communication": communication_ms,
+        "uncovered": uncovered_ms,
     }
     return result
 
 
 def summarize_metric(request_values: list[dict[str, float]]) -> dict:
-    components = ("total", "compute", "communication")
+    buckets = ("compute", "communication", "uncovered")
+    components = ("total", *buckets)
     result = {
         component: summarize([request[component] for request in request_values])
         for component in components
     }
-    result["total"]["mean"] = (
-        result["compute"]["mean"] + result["communication"]["mean"]
-    )
+    result["total"]["mean"] = sum(result[bucket]["mean"] for bucket in buckets)
     mean_total = result["total"]["mean"]
     result["mean_fraction"] = {
-        "compute": result["compute"]["mean"] / mean_total,
-        "communication": result["communication"]["mean"] / mean_total,
+        bucket: result[bucket]["mean"] / mean_total for bucket in buckets
     }
     for values in request_values:
-        if values["total"] != values["compute"] + values["communication"]:
+        if values["total"] != sum(values[bucket] for bucket in buckets):
             raise AssertionError(
-                "Summary input violates total = compute + communication"
+                "Summary input violates total = compute + communication + uncovered"
             )
     return result
 
@@ -771,14 +883,21 @@ def request_window_components(
         )
 
     total = interval_union_length(model_intervals)
-    compute = interval_union_length(compute_intervals)
+    merged_compute_intervals = merge_intervals(compute_intervals)
+    merged_communication_intervals = merge_intervals(communication_intervals)
+    compute = interval_union_length(merged_compute_intervals)
+    communication_active = interval_union_length(merged_communication_intervals)
+    kernel_coverage = interval_union_length(
+        (*merged_compute_intervals, *merged_communication_intervals)
+    )
     communication_compute_overlap = interval_intersection_length(
-        merge_intervals(communication_intervals), merge_intervals(compute_intervals)
+        merged_communication_intervals, merged_compute_intervals
     )
     window = window_end - window_start
-    if compute > total:
+    if compute > total or kernel_coverage > total:
         raise ValueError(
-            f"Compute union ({compute}) exceeds model span ({total}) in request window"
+            "Kernel interval union exceeds model span in request window: "
+            f"compute={compute}, coverage={kernel_coverage}, total={total}"
         )
     validate_communication_compute_overlap(
         communication_compute_overlap,
@@ -788,21 +907,28 @@ def request_window_components(
 
     ns_to_ms = 1e-6
     compute_ms = compute * ns_to_ms
-    communication_ms = (total - compute) * ns_to_ms
+    communication_ms = (communication_active - communication_compute_overlap) * ns_to_ms
+    uncovered_ms = (total - kernel_coverage) * ns_to_ms
     result = {
-        "total": compute_ms + communication_ms,
+        # Use the same summation operation as the serialized invariant check.
+        # Python 3.12's compensated sum can differ by one final bit from a
+        # left-associated ``a + b + c`` expression.
+        "total": sum((compute_ms, communication_ms, uncovered_ms)),
         "compute": compute_ms,
         "communication": communication_ms,
+        "uncovered": uncovered_ms,
         "outside_model": (window - total) * ns_to_ms,
         "client_window": window * ns_to_ms,
     }
     if not math.isclose(
         result["total"],
-        result["compute"] + result["communication"],
+        result["compute"] + result["communication"] + result["uncovered"],
         rel_tol=0.0,
         abs_tol=1e-12,
     ):
-        raise AssertionError("Request window violates total = compute + communication")
+        raise AssertionError(
+            "Request window violates total = compute + communication + uncovered"
+        )
     return result
 
 
@@ -890,12 +1016,13 @@ def analyze_request_windows(
             context=f"{request_context} E2E window",
         )
         inter_token_count = output_len - 1
-        tpot_compute = decode["compute"] / inter_token_count
-        tpot_communication = decode["communication"] / inter_token_count
+        tpot_buckets = {
+            bucket: decode[bucket] / inter_token_count
+            for bucket in ("compute", "communication", "uncovered")
+        }
         tpot = {
-            "total": tpot_compute + tpot_communication,
-            "compute": tpot_compute,
-            "communication": tpot_communication,
+            "total": sum(tpot_buckets.values()),
+            **tpot_buckets,
             "outside_model": decode["outside_model"] / inter_token_count,
             "client_window": decode["client_window"] / inter_token_count,
         }
@@ -969,12 +1096,6 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
-        "--graph-fraction-threshold",
-        type=float,
-        default=0.5,
-        help="Minimum graph-kernel fraction used to classify a decode step.",
-    )
-    parser.add_argument(
         "--communication-pattern",
         action="append",
         default=[],
@@ -1007,6 +1128,14 @@ def main() -> None:
             "Maximum compute/communication kernel overlap allowed per scheduler "
             "step or request window. Failures report both the observed overlap "
             "and this configured threshold."
+        ),
+    )
+    parser.add_argument(
+        "--require-prefill-cuda-graph",
+        action="store_true",
+        help=(
+            "Fail if any active measured prefill step contains no CUDA graph "
+            "nodes. Use when evaluating an explicitly configured prefill graph."
         ),
     )
     args = parser.parse_args()
@@ -1074,7 +1203,11 @@ def main() -> None:
             for scheduler_range in ranges
         ]
 
-    step_groups = build_step_groups(rank_steps, args.graph_fraction_threshold)
+    prefill_cuda_graph_execution = validate_prefill_cuda_graph_execution(
+        rank_steps, required=args.require_prefill_cuda_graph
+    )
+
+    step_groups = build_step_groups(rank_steps)
     available_dp_ranks = sorted({item.attn_dp_rank for item in topology.values()})
     critical_steps_by_dp = {
         dp_rank: critical_steps_for_dp(step_groups, dp_rank, topology)
@@ -1097,31 +1230,41 @@ def main() -> None:
                 for group in request_groups
             ]
             selected_critical_steps.extend(steps)
+            unexpected_phases = {
+                step.phase for step in steps if step.phase not in ("prefill", "decode")
+            }
+            if unexpected_phases:
+                raise ValueError(
+                    f"Request {request_index} contains unsupported phases for "
+                    f"concurrency-one attribution: {sorted(unexpected_phases)}"
+                )
             prefill_steps = [step for step in steps if step.phase == "prefill"]
-            graph_decode_steps = [step for step in steps if step.phase == "decode"]
-            if len(graph_decode_steps) == output_len:
-                drain_steps = graph_decode_steps[-1:]
-                decode_steps = graph_decode_steps[:-1]
+            traced_decode_steps = [step for step in steps if step.phase == "decode"]
+            if len(traced_decode_steps) == output_len:
+                drain_steps = traced_decode_steps[-1:]
+                decode_steps = traced_decode_steps[:-1]
                 drain_step_indices.add(drain_steps[0].index)
             else:
                 drain_steps = []
-                decode_steps = graph_decode_steps
+                decode_steps = traced_decode_steps
             ttft = component_totals(prefill_steps)
             decode = component_totals(decode_steps)
-            e2e_compute = ttft["compute"] + decode["compute"]
-            e2e_communication = ttft["communication"] + decode["communication"]
+            e2e_buckets = {
+                bucket: ttft[bucket] + decode[bucket]
+                for bucket in ("compute", "communication", "uncovered")
+            }
             e2e = {
-                "total": e2e_compute + e2e_communication,
-                "compute": e2e_compute,
-                "communication": e2e_communication,
+                "total": sum(e2e_buckets.values()),
+                **e2e_buckets,
             }
             decode_count = len(decode_steps)
-            tpot_compute = decode["compute"] / decode_count
-            tpot_communication = decode["communication"] / decode_count
+            tpot_buckets = {
+                bucket: decode[bucket] / decode_count
+                for bucket in ("compute", "communication", "uncovered")
+            }
             tpot = {
-                "total": tpot_compute + tpot_communication,
-                "compute": tpot_compute,
-                "communication": tpot_communication,
+                "total": sum(tpot_buckets.values()),
+                **tpot_buckets,
             }
             ttft_values.append(ttft)
             tpot_values.append(tpot)
@@ -1246,10 +1389,15 @@ def main() -> None:
             "scope": "GPU model execution inside scheduler.run_batch",
             "compute": "union of non-communication GPU kernel intervals",
             "communication": (
-                "communication-side critical-path time: selected-rank kernel "
-                "wall span minus compute, including associated waits and "
-                "synchronization"
+                "union of communication GPU kernel intervals after assigning "
+                "any tolerated compute overlap to compute"
             ),
+            "uncovered": (
+                "selected-rank first-to-last-kernel span with no classified "
+                "GPU kernel active; includes host launch and synchronization gaps"
+            ),
+            "additive_invariant": "total = compute + communication + uncovered",
+            "phase_source": "explicit scheduler batch-phase NVTX markers",
             "request_window_semantics": (
                 "GPU critical-path time experienced while each request is "
                 "outstanding; work from co-batched or preceding requests is "
@@ -1266,12 +1414,17 @@ def main() -> None:
         "rank_count": len(ranges_by_device),
         "request_count": request_count,
         "scheduler_step_count": len(step_groups),
-        "prefill_step_count": sum(step.phase == "prefill" for step in step_groups),
+        "prefill_step_count": sum(
+            any(rank.phase == "prefill" for rank in step.ranks.values())
+            for step in step_groups
+        ),
         "timed_decode_step_count": timed_decode_step_count,
         "drain_step_count": drain_step_count,
-        "graph_decode_step_count_including_drain": sum(
-            step.phase == "decode" for step in step_groups
+        "decode_step_count_including_drain": sum(
+            any(rank.phase == "decode" for rank in step.ranks.values())
+            for step in step_groups
         ),
+        "mixed_phase_step_count": sum(step.phase == "mixed" for step in step_groups),
         "critical_device_counts_by_attn_dp_rank": critical_device_counts_by_dp,
         "metrics": {
             "ttft_model_ms": summarize_metric(ttft_values),
@@ -1290,6 +1443,7 @@ def main() -> None:
         "request_window_validation": request_window_validation,
         "trace_validation": {
             "scheduler_range_counts_by_device": trace_validation,
+            "prefill_cuda_graph_execution_by_device": (prefill_cuda_graph_execution),
             "topology": [
                 {
                     "pid": item.pid,
@@ -1320,6 +1474,22 @@ def main() -> None:
                     reverse=True,
                 )
             ],
+            "selected_step_kernel_accounting_ms": {
+                "communication_kernel_active": sum(
+                    step.rank.communication_kernel_active
+                    for step in selected_critical_steps
+                )
+                * ns_to_ms,
+                "compute_communication_overlap": sum(
+                    step.rank.communication_compute_overlap
+                    for step in selected_critical_steps
+                )
+                * ns_to_ms,
+                "uncovered": sum(
+                    step.rank.uncovered for step in selected_critical_steps
+                )
+                * ns_to_ms,
+            },
             "step_selection_audit": step_selection_audit,
         },
         "critical_steps": [
@@ -1331,10 +1501,23 @@ def main() -> None:
                 "all_rank_longest_device": step.all_rank_longest.device,
                 "start_ms": step.rank.start * ns_to_ms,
                 "end_ms": step.rank.end * ns_to_ms,
-                "total_ms": (step.rank.compute * ns_to_ms)
-                + (step.rank.communication * ns_to_ms),
+                "total_ms": sum(
+                    (
+                        step.rank.compute * ns_to_ms,
+                        step.rank.communication * ns_to_ms,
+                        step.rank.uncovered * ns_to_ms,
+                    )
+                ),
                 "compute_ms": step.rank.compute * ns_to_ms,
                 "communication_ms": step.rank.communication * ns_to_ms,
+                "uncovered_ms": step.rank.uncovered * ns_to_ms,
+                "communication_kernel_active_ms": (
+                    step.rank.communication_kernel_active * ns_to_ms
+                ),
+                "compute_communication_overlap_ms": (
+                    step.rank.communication_compute_overlap * ns_to_ms
+                ),
+                "kernel_coverage_ms": step.rank.kernel_coverage * ns_to_ms,
                 "kernel_count": step.rank.kernel_count,
                 "graph_kernel_count": step.rank.graph_kernel_count,
                 "stream_count": step.rank.stream_count,

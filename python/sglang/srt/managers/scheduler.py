@@ -333,7 +333,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_SCHEDULER_ENABLED,
+    scheduler_nvtx_batch_phase_mark,
+    scheduler_nvtx_method,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
@@ -4028,6 +4032,25 @@ class Scheduler(
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        if NVTX_SCHEDULER_ENABLED:
+            forward_mode = batch.forward_mode
+            if forward_mode.is_idle():
+                trace_phase = "idle"
+            elif (
+                forward_mode.is_decode()
+                or forward_mode.is_prebuilt()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            ):
+                trace_phase = "decode"
+            elif forward_mode.is_extend():
+                trace_phase = "prefill"
+            else:
+                raise RuntimeError(
+                    f"Cannot classify scheduler trace phase for {forward_mode!r}"
+                )
+            scheduler_nvtx_batch_phase_mark(trace_phase)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)

@@ -7,7 +7,10 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.utils.nvtx_utils import MEASUREMENT_MARKER_PREFIX
+from sglang.srt.utils.nvtx_utils import (
+    BATCH_PHASE_MARKER_PREFIX,
+    MEASUREMENT_MARKER_PREFIX,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
@@ -91,6 +94,30 @@ class TestProfilerMarker(unittest.TestCase):
         encoded = message.removeprefix(MEASUREMENT_MARKER_PREFIX)
         self.assertEqual(json.loads(encoded), payload)
         self.assertNotIn(" ", encoded)
+
+    def test_batch_phase_marker_has_stable_prefix(self):
+        with (
+            patch("sglang.srt.utils.nvtx_utils.NVTX_SCHEDULER_ENABLED", True),
+            patch("sglang.srt.utils.nvtx_utils._nvtx_module") as nvtx_module,
+        ):
+            from sglang.srt.utils.nvtx_utils import scheduler_nvtx_batch_phase_mark
+
+            scheduler_nvtx_batch_phase_mark("prefill")
+
+        nvtx_module.mark.assert_called_once_with(
+            BATCH_PHASE_MARKER_PREFIX + "prefill", color="orange"
+        )
+
+    def test_batch_phase_marker_is_noop_when_scheduler_nvtx_is_disabled(self):
+        with (
+            patch("sglang.srt.utils.nvtx_utils.NVTX_SCHEDULER_ENABLED", False),
+            patch("sglang.srt.utils.nvtx_utils._nvtx_module") as nvtx_module,
+        ):
+            from sglang.srt.utils.nvtx_utils import scheduler_nvtx_batch_phase_mark
+
+            scheduler_nvtx_batch_phase_mark("decode")
+
+        nvtx_module.mark.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -14,9 +14,15 @@ the matching attention-DP rank, then selects the longest-running device within
 that group. An idle DP rank can therefore remain visible in audit data without
 being used for the request's reported metrics. Compute is the union of
 non-communication kernel intervals on the selected device. Communication is
-the remaining step wall time, so collective execution, dependency waits, and
-communication-induced synchronization stay in one bucket and
-`total = compute + communication`.
+exclusive communication-kernel-active time. Uncovered is the remainder of the
+first-to-last-kernel span during which no classified GPU kernel is active:
+
+```text
+total = compute + communication + uncovered
+```
+
+Uncovered can include host launch latency, synchronization, or other gaps; it
+is reported without assigning a mechanism to it.
 
 More formally, for scheduler step `s` and request DP rank `d`, the analyzer
 selects `r*` from the marked topology group `attn_dp_rank == d` and computes:
@@ -24,8 +30,15 @@ selects `r*` from the marked topology group `attn_dp_rank == d` and computes:
 ```text
 total(s)         = last_kernel_end(s, r*) - first_kernel_start(s, r*)
 compute(s)       = duration(union(non_communication_kernel_intervals(s, r*)))
-communication(s) = total(s) - compute(s)
+communication(s) = duration(union(communication_kernel_intervals(s, r*)))
+                   - compute_communication_overlap(s)
+uncovered(s)     = total(s) - duration(union(all_kernel_intervals(s, r*)))
 ```
+
+The expected workload does not meaningfully overlap compute and communication.
+A small configurable timestamp tolerance is allowed and assigned to compute
+exactly once; raw communication-kernel activity and overlap remain in
+diagnostics.
 
 At concurrency one, phase groups map unambiguously to requests. Metric values
 are assembled without overlap:
@@ -35,6 +48,10 @@ TTFT = sum(all chunked-prefill steps, including first-token sampling)
 TPOT = sum(the output_len - 1 client-timed decode steps) / (output_len - 1)
 E2E  = TTFT + sum(the output_len - 1 client-timed decode steps)
 ```
+
+Each `scheduler.run_batch` range contains an explicit `prefill`, `decode`, or
+`idle` NVTX marker emitted from the scheduler's forward mode. Phase attribution
+therefore remains correct when prefill itself executes through a CUDA graph.
 
 At higher concurrency, scheduler steps contain several requests, so phase
 groups cannot be assigned to one request. The analyzer instead uses the
@@ -57,17 +74,14 @@ path while the request is outstanding. Time outside `scheduler.run_batch`
 remains an explicit `outside_model` validation residual and is never mislabeled
 as communication.
 
-Communication is therefore an operational communication/synchronization
-bucket, not merely the sum of NCCL or Purlin kernel residency. Kernel-name
-classification determines what is excluded from compute; the complement also
-captures collective dependency waits, inter-stream synchronization, and launch
-gaps on the communication path. This is the requested binary decomposition and
-is appropriate here because communication and compute do not meaningfully
-overlap. By default, an overlap above 25 microseconds in any step or request
-window is a hard validation failure; smaller timestamp-scale slivers are
-tolerated. Use `--overlap-tolerance-ns` to supply a hardware-calibrated limit.
-A failure reports the observed overlap, configured threshold, excess, and the
-offending device step or request window in both nanoseconds and microseconds.
+Communication is therefore kernel-active collective time, including time a
+collective kernel itself spends waiting, but it no longer absorbs uncovered
+launch or synchronization gaps. By default, compute/communication overlap
+above 25 microseconds in any step or request window is a hard validation
+failure; smaller timestamp-scale slivers are tolerated. Use
+`--overlap-tolerance-ns` to supply a hardware-calibrated limit. A failure
+reports the observed overlap, configured threshold, excess, and the offending
+device step or request window in both nanoseconds and microseconds.
 
 The breakdown is deliberately model-side. Client latency also contains HTTP,
 tokenization, scheduling outside model forwards, and detokenization; clean
@@ -184,10 +198,28 @@ The attention-backend distinction is intentional:
 
 Communication classification is deliberately explicit. Names beginning with
 `ncclDevKernel_`, the known SGLang custom-collective names, and the known Purlin
-collective names are communication; everything else is compute. A future
+collective names are communication; every other recognized kernel is compute.
+A future
 collective-looking but unrecognized name is a hard failure. If another backend
 needs an addition, pass its reviewed exact name with
 `--communication-pattern <kernel-name>` and verify the emitted diagnostics.
+
+Random prompts are sent as token IDs by default, so `--input-len` is the exact
+server-side prefill token count. This matters when a prefill graph is captured
+for specific token counts. Use `--no-tokenize-prompt` only for a deliberate
+text-tokenization experiment.
+
+For a prefill-graph experiment, pass the backend and its captured token sizes
+directly through the suite, for example:
+
+```bash
+--cuda-graph-backend-prefill breakable --cuda-graph-bs-prefill 1024
+```
+
+An explicitly selected non-disabled prefill backend also enables measured-graph
+validation: analysis fails if any active measured prefill has no CUDA graph
+nodes. `--no-require-prefill-cuda-graph` is available for deliberate fallback
+experiments.
 
 ## What the runner does
 
@@ -255,7 +287,7 @@ variant with `--resume`.
   `scheduler.run_batch` NVTX range to CUDA kernels through runtime correlation
   IDs, validates marker boundaries and topology, and chooses the critical
   device within the request's attention-DP group. At concurrency one it uses
-  prefill/CUDA-graph phase groups and removes the overlap scheduler's drain
+  explicit scheduler phase markers and removes the overlap scheduler's drain
   replay. At higher concurrency it clock-aligns each request with its own DP
   timeline.
 - `summarize_results.py` joins clean client metrics, marker-only calibration,

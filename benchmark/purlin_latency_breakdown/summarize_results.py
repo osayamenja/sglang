@@ -14,6 +14,8 @@ METRICS = {
     "tpot": ("mean_tpot_ms", "tpot_model_ms"),
     "e2e": ("mean_e2e_latency_ms", "e2e_model_ms"),
 }
+TRACE_BUCKETS = ("compute", "communication", "uncovered")
+TRACE_COMPONENTS = ("total", *TRACE_BUCKETS)
 
 
 def load_json(path: Path) -> dict:
@@ -59,7 +61,7 @@ def build_observations(metrics: dict) -> dict:
                     values["trace_model"][component]["baseline_ms"],
                     values["trace_model"][component]["purlin_ms"],
                 )
-                for component in ("total", "compute", "communication")
+                for component in TRACE_COMPONENTS
             },
         }
     return observations
@@ -99,7 +101,7 @@ def main() -> None:
         trace_baseline = breakdown["baseline"]["metrics"][trace_key]
         trace_purlin = breakdown["purlin"]["metrics"][trace_key]
         component_comparison = {}
-        for component in ("total", "compute", "communication"):
+        for component in TRACE_COMPONENTS:
             baseline_value = trace_baseline[component]["mean"]
             purlin_value = trace_purlin[component]["mean"]
             component_comparison[component] = {
@@ -110,16 +112,12 @@ def main() -> None:
             }
         saved_total = component_comparison["total"]["saved_ms"]
         component_comparison["raw_delta_fraction_of_total_delta"] = {
-            "compute": (
-                component_comparison["compute"]["saved_ms"] / saved_total
+            bucket: (
+                component_comparison[bucket]["saved_ms"] / saved_total
                 if saved_total
                 else None
-            ),
-            "communication": (
-                component_comparison["communication"]["saved_ms"] / saved_total
-                if saved_total
-                else None
-            ),
+            )
+            for bucket in TRACE_BUCKETS
         }
         metrics[metric] = {
             "clean_client": {

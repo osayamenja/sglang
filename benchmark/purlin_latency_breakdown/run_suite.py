@@ -233,6 +233,13 @@ def common_server_command(args: argparse.Namespace, variant: str) -> list[str]:
         command.append("--enable-dp-attention")
     if args.trust_remote_code:
         command.append("--trust-remote-code")
+    if args.cuda_graph_backend_prefill is not None:
+        command.extend(
+            ("--cuda-graph-backend-prefill", args.cuda_graph_backend_prefill)
+        )
+    if args.cuda_graph_bs_prefill:
+        command.append("--cuda-graph-bs-prefill")
+        command.extend(str(value) for value in args.cuda_graph_bs_prefill)
     if variant == "purlin":
         command.append("--enable-purlin")
     command.extend(args.server_arg)
@@ -286,6 +293,8 @@ def client_command(
         "--output-file",
         str(output_file),
     ]
+    if args.tokenize_prompt:
+        command.append("--tokenize-prompt")
     if profile:
         # With no profile-num-steps, the serving benchmark calls /stop_profile
         # only after every response has completed. cudaProfilerStop therefore
@@ -343,6 +352,7 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
             "warmup_requests": args.warmup_requests,
             "seed": args.seed,
             "random_range_ratio": args.random_range_ratio,
+            "tokenize_prompt": args.tokenize_prompt,
         },
         "server": {
             "mem_fraction_static": args.mem_fraction_static,
@@ -356,6 +366,8 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
             ),
             "chunked_prefill_size": args.chunked_prefill_size,
             "cuda_graph_max_bs_decode": args.cuda_graph_max_bs_decode,
+            "cuda_graph_backend_prefill": args.cuda_graph_backend_prefill,
+            "cuda_graph_bs_prefill": args.cuda_graph_bs_prefill,
             "enable_dp_attention": args.enable_dp_attention,
             "trust_remote_code": args.trust_remote_code,
             "extra_args": args.server_arg,
@@ -363,6 +375,7 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
         "analysis": {
             "overlap_tolerance_ns": args.overlap_tolerance_ns,
             "additional_communication_kernel_names": args.communication_pattern,
+            "require_prefill_cuda_graph": args.require_prefill_cuda_graph,
         },
         "variants": args.variants,
         "skip_clean": args.skip_clean,
@@ -500,6 +513,8 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
         "--overlap-tolerance-ns",
         str(args.overlap_tolerance_ns),
     ]
+    if args.require_prefill_cuda_graph:
+        analysis_command.append("--require-prefill-cuda-graph")
     for pattern in args.communication_pattern:
         analysis_command.extend(("--communication-pattern", pattern))
     run_streamed(analysis_command, analysis_log)
@@ -547,6 +562,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunked-prefill-size", type=int, default=4096)
     parser.add_argument("--cuda-graph-max-bs-decode", type=int, default=256)
+    parser.add_argument(
+        "--cuda-graph-backend-prefill",
+        choices=("breakable", "tc_piecewise", "disabled"),
+        help="Explicit prefill CUDA-graph backend passed to the server.",
+    )
+    parser.add_argument(
+        "--cuda-graph-bs-prefill",
+        type=int,
+        nargs="+",
+        help="Exact prefill token sizes captured by the selected graph backend.",
+    )
     parser.add_argument("--watchdog-timeout", type=float, default=3600)
     parser.add_argument("--input-len", type=int, default=4096)
     parser.add_argument("--output-len", type=int, default=256)
@@ -560,6 +586,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-requests", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--random-range-ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--tokenize-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Send random prompts as token IDs so --input-len exactly matches "
+            "the server-side prefill shape."
+        ),
+    )
+    parser.add_argument(
+        "--require-prefill-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Require every measured active prefill to execute CUDA graph nodes. "
+            "Defaults on for an explicitly selected non-disabled prefill backend."
+        ),
+    )
     parser.add_argument("--server-host", default="0.0.0.0")
     parser.add_argument("--client-host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -612,6 +656,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--concurrency must be positive")
     if args.overlap_tolerance_ns < 0:
         parser.error("--overlap-tolerance-ns must be non-negative")
+    if args.cuda_graph_bs_prefill and any(
+        value < 1 for value in args.cuda_graph_bs_prefill
+    ):
+        parser.error("--cuda-graph-bs-prefill values must be positive")
+    if args.require_prefill_cuda_graph is None:
+        args.require_prefill_cuda_graph = args.cuda_graph_backend_prefill not in (
+            None,
+            "disabled",
+        )
     if args.output_len < 2:
         parser.error("full E2E decomposition requires --output-len >= 2")
     if args.trace_prompts is None:

@@ -57,6 +57,7 @@ NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
 
 MEASUREMENT_MARKER_PREFIX = "sglang.measurement:"
+BATCH_PHASE_MARKER_PREFIX = "sglang.batch_phase:"
 
 # Default nvtx colors for statically-named spans (only used on the nvtx path).
 _NVTX_COLOR_MAP = {
@@ -137,3 +138,17 @@ def scheduler_nvtx_mark(payload: dict) -> None:
         payload, separators=(",", ":"), sort_keys=True
     )
     _nvtx_module.mark(message, color="yellow")
+
+
+def scheduler_nvtx_batch_phase_mark(phase: str) -> None:
+    """Mark the phase of one ``scheduler.run_batch`` range for trace analysis.
+
+    Unlike measurement-boundary markers, this helper is intentionally a no-op
+    when scheduler NVTX is disabled because it is called on every forward pass.
+    """
+
+    if not NVTX_SCHEDULER_ENABLED:
+        return
+    if phase not in ("prefill", "decode", "idle"):
+        raise ValueError(f"Unsupported scheduler batch phase: {phase!r}")
+    _nvtx_module.mark(BATCH_PHASE_MARKER_PREFIX + phase, color="orange")

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,32 +25,36 @@ def _rank_step(
     *,
     compute_intervals=None,
     communication_intervals=None,
+    phase="prefill",
 ):
     compute_intervals = tuple(compute_intervals or ((start, end),))
     communication_intervals = tuple(communication_intervals or ())
     total = end - start
     compute = trace.interval_union_length(compute_intervals)
+    communication_active = trace.interval_union_length(communication_intervals)
+    overlap = trace.interval_intersection_length(
+        communication_intervals, compute_intervals
+    )
+    coverage = trace.interval_union_length(
+        (*compute_intervals, *communication_intervals)
+    )
     return trace.RankStep(
         device=device,
         start=start,
         end=end,
         total=total,
         compute=compute,
-        communication=total - compute,
-        communication_kernel_active=trace.interval_union_length(
-            communication_intervals
-        ),
-        communication_compute_overlap=trace.interval_intersection_length(
-            communication_intervals, compute_intervals
-        ),
-        kernel_coverage=trace.interval_union_length(
-            (*compute_intervals, *communication_intervals)
-        ),
+        communication=communication_active - overlap,
+        uncovered=total - coverage,
+        communication_kernel_active=communication_active,
+        communication_compute_overlap=overlap,
+        kernel_coverage=coverage,
         kernel_count=max(1, len(compute_intervals) + len(communication_intervals)),
         graph_kernel_count=0,
         stream_count=1,
         compute_intervals=compute_intervals,
         communication_intervals=communication_intervals,
+        phase=phase,
     )
 
 
@@ -70,11 +75,59 @@ def _topology(device, pid, dp_rank, attn_tp_rank=0):
 
 
 class TestTraceBoundaries(unittest.TestCase):
+    def test_scheduler_phase_marker_is_paired_with_enclosing_range(self):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript("""
+            CREATE TABLE NVTX_EVENTS (
+                start INTEGER, end INTEGER, globalTid INTEGER,
+                textId INTEGER, text TEXT
+            );
+            CREATE TABLE StringIds (id INTEGER, value TEXT);
+            """)
+        global_tid = (10 << 24) | 7
+        connection.execute(
+            "INSERT INTO NVTX_EVENTS VALUES (100, 200, ?, NULL, ?)",
+            (global_tid, "scheduler.run_batch"),
+        )
+        connection.execute(
+            "INSERT INTO NVTX_EVENTS VALUES (110, NULL, ?, NULL, ?)",
+            (global_tid, trace.BATCH_PHASE_MARKER_PREFIX + "prefill"),
+        )
+
+        self.assertEqual(
+            trace.scheduler_ranges_by_pid(connection),
+            {10: [(100, 200, global_tid, "prefill")]},
+        )
+
+    def test_missing_scheduler_phase_marker_fails(self):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript("""
+            CREATE TABLE NVTX_EVENTS (
+                start INTEGER, end INTEGER, globalTid INTEGER,
+                textId INTEGER, text TEXT
+            );
+            CREATE TABLE StringIds (id INTEGER, value TEXT);
+            INSERT INTO NVTX_EVENTS VALUES (
+                100, 200, 167772167, NULL, 'scheduler.run_batch'
+            );
+            """)
+        with self.assertRaisesRegex(ValueError, "batch_phase"):
+            trace.scheduler_ranges_by_pid(connection)
+
     def test_prefix_imbalance_outside_markers_is_discarded(self):
         topology = {0: _topology(0, 10, 0), 1: _topology(1, 11, 1)}
         ranges = {
-            10: [(10, 20, 1), (30, 40, 1), (110, 120, 1), (130, 140, 1)],
-            11: [(20, 30, 2), (115, 125, 2), (135, 145, 2)],
+            10: [
+                (10, 20, 1, "prefill"),
+                (30, 40, 1, "decode"),
+                (110, 120, 1, "prefill"),
+                (130, 140, 1, "decode"),
+            ],
+            11: [
+                (20, 30, 2, "idle"),
+                (115, 125, 2, "idle"),
+                (135, 145, 2, "idle"),
+            ],
         }
 
         measured, validation = trace.filter_scheduler_ranges_to_measurement(
@@ -90,8 +143,8 @@ class TestTraceBoundaries(unittest.TestCase):
     def test_rank_imbalance_inside_markers_still_fails(self):
         topology = {0: _topology(0, 10, 0), 1: _topology(1, 11, 1)}
         ranges = {
-            10: [(110, 120, 1), (130, 140, 1)],
-            11: [(115, 125, 2)],
+            10: [(110, 120, 1, "prefill"), (130, 140, 1, "decode")],
+            11: [(115, 125, 2, "idle")],
         }
         with self.assertRaisesRegex(ValueError, "counts differ"):
             trace.filter_scheduler_ranges_to_measurement(ranges, topology)
@@ -99,7 +152,9 @@ class TestTraceBoundaries(unittest.TestCase):
     def test_range_crossing_marker_fails(self):
         topology = {0: _topology(0, 10, 0)}
         with self.assertRaisesRegex(ValueError, "crosses measurement boundary"):
-            trace.filter_scheduler_ranges_to_measurement({10: [(90, 110, 1)]}, topology)
+            trace.filter_scheduler_ranges_to_measurement(
+                {10: [(90, 110, 1, "prefill")]}, topology
+            )
 
 
 class TestTopologyAndDPSelection(unittest.TestCase):
@@ -174,6 +229,34 @@ class TestTopologyAndDPSelection(unittest.TestCase):
 
 
 class TestRequestAttribution(unittest.TestCase):
+    def test_prefill_phase_does_not_depend_on_cuda_graph_fraction(self):
+        prefill_graph = replace(
+            _rank_step(0, 0, 100, phase="prefill"),
+            graph_kernel_count=10,
+            kernel_count=10,
+        )
+        idle = _rank_step(1, 0, 90, phase="idle")
+
+        groups = trace.build_step_groups({0: [prefill_graph], 1: [idle]})
+
+        self.assertEqual(groups[0].phase, "prefill")
+
+    def test_required_prefill_cuda_graph_rejects_eager_fallback(self):
+        with self.assertRaisesRegex(ValueError, "ran eagerly.*\\(0, 0\\)"):
+            trace.validate_prefill_cuda_graph_execution(
+                {0: [_rank_step(0, 0, 100, phase="prefill")]}, required=True
+            )
+
+    def test_required_prefill_cuda_graph_accepts_graph_nodes(self):
+        graphed = replace(_rank_step(0, 0, 100, phase="prefill"), graph_kernel_count=1)
+
+        audit = trace.validate_prefill_cuda_graph_execution(
+            {0: [graphed]}, required=True
+        )
+
+        self.assertEqual(audit[0]["graphed_prefill_steps"], 1)
+        self.assertEqual(audit[0]["eager_prefill_steps"], 0)
+
     def test_concurrent_requests_use_individual_dp_timelines(self):
         dp0_rank = _rank_step(0, 0, 40)
         dp1_rank = _rank_step(1, 0, 100)
@@ -205,26 +288,64 @@ class TestRequestAttribution(unittest.TestCase):
         self.assertEqual([detail["dp_rank"] for detail in details], [0, 1])
         self.assertLess(e2e[0]["total"], e2e[1]["total"])
 
-    def test_two_bucket_invariant_holds_at_every_level(self):
+    def test_three_bucket_invariant_holds_at_every_level(self):
         rank = _rank_step(
             0,
             0,
             100,
-            compute_intervals=((0, 60),),
-            communication_intervals=((60, 100),),
+            compute_intervals=((0, 50),),
+            communication_intervals=((60, 90),),
         )
         step = trace.CriticalStep(0, "prefill", rank, rank)
         request = trace.component_totals([step])
         summarized = trace.summarize_metric([request, request])
 
-        self.assertEqual(rank.total, rank.compute + rank.communication)
+        self.assertEqual(rank.total, rank.compute + rank.communication + rank.uncovered)
+        self.assertEqual(rank.uncovered, 20)
         self.assertEqual(
-            request["total"], request["compute"] + request["communication"]
+            request["total"],
+            request["compute"] + request["communication"] + request["uncovered"],
         )
         self.assertEqual(
             summarized["total"]["mean"],
-            summarized["compute"]["mean"] + summarized["communication"]["mean"],
+            summarized["compute"]["mean"]
+            + summarized["communication"]["mean"]
+            + summarized["uncovered"]["mean"],
         )
+
+    def test_tolerated_overlap_is_assigned_to_compute_once(self):
+        rank = _rank_step(
+            0,
+            0,
+            100,
+            compute_intervals=((0, 60),),
+            communication_intervals=((50, 80),),
+        )
+
+        self.assertEqual(rank.communication_kernel_active, 30)
+        self.assertEqual(rank.communication_compute_overlap, 10)
+        self.assertEqual(rank.communication, 20)
+        self.assertEqual(rank.uncovered, 20)
+        self.assertEqual(rank.total, rank.compute + rank.communication + rank.uncovered)
+
+    def test_request_window_serializes_an_exact_additive_total(self):
+        rank = _rank_step(
+            0,
+            0,
+            1_000_003,
+            compute_intervals=((0, 333_331),),
+            communication_intervals=((400_003, 700_009),),
+        )
+
+        values = trace.request_window_components(
+            [trace.CriticalStep(0, "prefill", rank, rank)], 0, 1_000_003
+        )
+
+        self.assertEqual(
+            values["total"],
+            sum(values[bucket] for bucket in ("compute", "communication", "uncovered")),
+        )
+        trace.summarize_metric([values])
 
     def test_unexpected_overlap_fails(self):
         rank = _rank_step(
@@ -270,6 +391,7 @@ class TestSummaryWording(unittest.TestCase):
                     "baseline_ms": communication_baseline,
                     "purlin_ms": communication_purlin,
                 },
+                "uncovered": {"baseline_ms": 1.0, "purlin_ms": 0.5},
             },
         }
 
