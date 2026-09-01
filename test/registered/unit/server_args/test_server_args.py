@@ -107,9 +107,7 @@ class TestPrepareServerArgs(CustomTestCase):
     def test_communication_backend_flags_are_mutually_exclusive(self):
         parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        parsed = parser.parse_args(
-            ["--model-path", "dummy", "--enable-torchcomms"]
-        )
+        parsed = parser.parse_args(["--model-path", "dummy", "--enable-torchcomms"])
         server_args = ServerArgs.from_cli_args(parsed)
         self.assertTrue(server_args.enable_torchcomms)
 

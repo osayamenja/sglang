@@ -39,9 +39,7 @@ def check_server_args(server_args: Any):
         if enabled
     ]
     if len(communication_backends) > 1:
-        raise ValueError(
-            f"{', '.join(communication_backends)} are mutually exclusive."
-        )
+        raise ValueError(f"{', '.join(communication_backends)} are mutually exclusive.")
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

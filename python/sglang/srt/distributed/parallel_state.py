@@ -796,9 +796,7 @@ class GroupCoordinator:
 
         if self._can_use_torchcomms(
             input_, require_reduce_dtype=True
-        ) or self._can_use_purlin(
-            input_, require_reduce_dtype=True
-        ):
+        ) or self._can_use_purlin(input_, require_reduce_dtype=True):
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
@@ -1345,9 +1343,7 @@ class GroupCoordinator:
         else:
             assert output.shape == output_shape
 
-        if self._can_use_torchcomms(
-            input_, output, require_reduce_dtype=True
-        ):
+        if self._can_use_torchcomms(input_, output, require_reduce_dtype=True):
             self.torchcomms_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
@@ -1610,8 +1606,7 @@ class GroupCoordinator:
             size_list.append(s)
 
         if all(
-            self._can_use_torchcomms(inp, out)
-            for inp, out in zip(input_, output_list)
+            self._can_use_torchcomms(inp, out) for inp, out in zip(input_, output_list)
         ):
             for inp, out, s in zip(input_, output_list, size_list):
                 self.torchcomms_comm.all_gather(out, inp, sizes=s)

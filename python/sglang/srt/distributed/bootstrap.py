@@ -19,8 +19,8 @@ from sglang.srt.distributed import (
     set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_purlin,
-    set_torchcomms,
     set_torch_symm_mem_all_reduce,
+    set_torchcomms,
 )
 from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
