@@ -26,6 +26,11 @@
 
 ## Install This Fork
 
+This fork is rebased on upstream SGLang
+[`0f18d389b46bdb8d8860481019f55b402ec65a06`](https://github.com/sgl-project/sglang/commit/0f18d389b46bdb8d8860481019f55b402ec65a06)
+(2026-09-01). At that base commit, SGLang's version resolver reports
+`0.5.19.dev806+g0f18d389b` (based on release tag `v0.5.18`).
+
 This fork integrates [Purlin](https://pypi.org/project/purlin/) as an SGLang
 communication backend. The installer supports Ubuntu with a CUDA 12.9 or CUDA
 13 toolkit and installs the tested `purlin==0.6.0` release.
