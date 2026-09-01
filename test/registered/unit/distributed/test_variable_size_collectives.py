@@ -49,6 +49,7 @@ def make_coordinator():
     coordinator.world_size = 2
     coordinator.rank_in_group = 0
     coordinator.pynccl_comm = FakePyNcclCommunicator()
+    coordinator.torchcomms_comm = None
     coordinator._can_use_purlin = lambda *args, **kwargs: False
     return coordinator
 
