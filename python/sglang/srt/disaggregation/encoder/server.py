@@ -38,6 +38,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
     set_purlin,
+    set_torchcomms,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
@@ -499,6 +500,7 @@ class MMEncoder:
             local_rank=rank,
         )
         set_purlin(server_args.enable_purlin)
+        set_torchcomms(server_args.enable_torchcomms)
         initialize_model_parallel(tensor_model_parallel_size=get_parallel().tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
