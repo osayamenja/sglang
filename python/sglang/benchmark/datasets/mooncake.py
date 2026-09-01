@@ -83,8 +83,8 @@ async def get_mooncake_request_over_time(
         hash_ids = record.get("hash_ids", [])
         for hash_id in hash_ids:
             user_query_base += f"{hash_id}" + " ".join(
-                ["hi"] * 128
-            )  # Shorter for multi-round
+                ["hi"] * 512
+            )  # 512-token blocks match the trace's KV-block granularity (single-round replay).
         user_query_base += "Tell me a story based on this context."
 
         output_len_per_round = record.get("output_length", 256)

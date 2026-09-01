@@ -267,6 +267,36 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             self.vae_config.get_vae_scale_factor(),
         )
 
+    @staticmethod
+    def _repeat_conditioning_for_outputs(batch, tensors):
+        """Match prompt conditioning to the latent batch for n > 1 outputs."""
+        if tensors is None:
+            return None
+
+        target_batch = int(batch.raw_latent_shape[0])
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        repeated = []
+        for tensor in tensors:
+            if tensor.shape[0] == target_batch:
+                repeated.append(tensor)
+            elif tensor.shape[0] * num_outputs == target_batch:
+                repeated.append(tensor.repeat_interleave(num_outputs, dim=0))
+            else:
+                raise ValueError(
+                    "QwenImage prompt conditioning batch mismatch: "
+                    f"got {tensor.shape[0]}, expected {target_batch} or "
+                    f"{target_batch // num_outputs} before output expansion."
+                )
+        return repeated
+
+    def get_pos_prompt_embeds(self, batch):
+        return self._repeat_conditioning_for_outputs(batch, batch.prompt_embeds)
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._repeat_conditioning_for_outputs(
+            batch, batch.negative_prompt_embeds
+        )
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         vae_scale_factor = self.get_vae_scale_factor()
         height = 2 * (batch.height // (vae_scale_factor * 2))
@@ -330,6 +360,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         The kwargs include text lengths for RoPE construction and optional
         encoder masks for cross-attention.
         """
+        prompt_embeds = self._repeat_conditioning_for_outputs(batch, prompt_embeds)
         batch_size = prompt_embeds[0].shape[0]
         text_seq_len = prompt_embeds[0].shape[1]
         height = batch.height
@@ -389,9 +420,25 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         if batch_size == 1:
             return [text_seq_len], None
 
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        if batch_size % num_outputs != 0:
+            raise ValueError(
+                f"QwenImage conditioning batch {batch_size} is not divisible by "
+                f"num_outputs_per_prompt={num_outputs}."
+            )
+        prompt_batch_size = batch_size // num_outputs
         txt_seq_lens = self.require_text_seq_lens(
-            batch, encoder_index, negative=negative, expected_batch_size=batch_size
+            batch,
+            encoder_index,
+            negative=negative,
+            expected_batch_size=prompt_batch_size,
         )
+        if num_outputs > 1:
+            txt_seq_lens = [
+                seq_len
+                for seq_len in txt_seq_lens
+                for _ in range(num_outputs)
+            ]
         encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
             batch,
             encoder_index,
@@ -434,6 +481,13 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         )
         if masks_by_encoder is not None and encoder_index < len(masks_by_encoder):
             mask = masks_by_encoder[encoder_index]
+            num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+            prompt_batch_size = batch_size // num_outputs
+            if (
+                num_outputs > 1
+                and mask.shape == (prompt_batch_size, text_seq_len)
+            ):
+                mask = mask.repeat_interleave(num_outputs, dim=0)
             if mask.shape != (batch_size, text_seq_len):
                 raise ValueError(
                     "QwenImage text conditioning mask has shape "

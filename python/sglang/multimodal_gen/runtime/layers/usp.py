@@ -5,7 +5,6 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
@@ -81,8 +80,10 @@ def _a2a_staging_buffer(
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
-    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    sp_group = get_sp_group()
+    assert (
+        sp_group.ulysses_group is not None
+    ), "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
     if role is None:
@@ -91,7 +92,7 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    sp_group.ulysses_all_to_all_single(output, x)
     return output.reshape(x_shape)
 
 
@@ -100,16 +101,17 @@ def _usp_all_to_all_single_varlen(
     output_split_sizes: list[int],
     input_split_sizes: list[int],
 ) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
-    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    sp_group = get_sp_group()
+    assert (
+        sp_group.ulysses_group is not None
+    ), "Ulysses process group is not initialized."
     x = x.flatten().contiguous()
     output = torch.empty(sum(output_split_sizes), dtype=x.dtype, device=x.device)
-    dist.all_to_all_single(
+    sp_group.ulysses_all_to_all_v(
         output,
         x,
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
-        group=ulysses_pg,
     )
     return output
 

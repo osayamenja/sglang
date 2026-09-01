@@ -44,6 +44,20 @@ class PyMscclppCommunicator:
             target_size = 1 << (size - 1).bit_length()
         return self.best_configs.get(target_size)
 
+    def _is_tuning_candidate_supported(self, algo, nblocks, nthreads):
+        # On A100 (SM80), MSCCL++ 0.9.1's 8-rank RSAG zero-copy kernel spins
+        # indefinitely at 128 blocks and 768 threads. Exclude both high-thread
+        # variants because the in-process tuner cannot recover to test 1024
+        # after a hung kernel. H100 keeps the full search space.
+        capability = torch.cuda.get_device_capability(self.device)
+        return not (
+            capability == (8, 0)
+            and self.world_size == 8
+            and algo.name == "default_allreduce_rsag_zero_copy"
+            and nblocks == 128
+            and nthreads >= 768
+        )
+
     def _create_dsl_algorithms(self):
         dsl_algos_config = []
         n_nodes = self.world_size // self.nranks_per_node
@@ -186,6 +200,7 @@ class PyMscclppCommunicator:
 
     def _tune(self, n_warmup, n_graph_launches, n_ops_per_graph, algos_config):
         sizes = [1 << i for i in range(9, 24)]
+        logged_unsupported_candidates = set()
         dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
             data_type=str(torch.float16)
         )
@@ -202,6 +217,22 @@ class PyMscclppCommunicator:
                 ):
                     for nb in candidates_nblocks:
                         for nt in candidates_nthreads:
+                            if not self._is_tuning_candidate_supported(algo, nb, nt):
+                                candidate = (algo.name, nb, nt)
+                                if (
+                                    self.rank == 0
+                                    and candidate not in logged_unsupported_candidates
+                                ):
+                                    logger.warning(
+                                        "Skipping unsupported MSCCL++ tuning "
+                                        "candidate on SM80: algo=%s nblocks=%d "
+                                        "nthreads=%d",
+                                        algo.name,
+                                        nb,
+                                        nt,
+                                    )
+                                    logged_unsupported_candidates.add(candidate)
+                                continue
                             avg_time = self._get_time(
                                 algo,
                                 tune_tensor,

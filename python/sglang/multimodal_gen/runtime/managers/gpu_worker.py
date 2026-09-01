@@ -285,6 +285,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dp_size=self.server_args.dp_size,
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            enable_purlin=self.server_args.enable_purlin,
         )
 
         from sglang.srt.runtime_context import get_context, publish

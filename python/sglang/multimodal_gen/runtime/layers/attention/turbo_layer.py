@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
 )
@@ -43,6 +44,26 @@ def post_all2all(local_seq_2_local_head, seq_world_size):
     return post_func
 
 
+def _all_to_all_single(
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    group: ProcessGroup,
+    async_op: bool = False,
+    stream: torch.get_device_module().Stream | None = None,
+):
+    try:
+        sp_group = get_sp_group()
+    except AssertionError:
+        sp_group = None
+
+    if sp_group is not None and group is sp_group.ulysses_group:
+        return sp_group.ulysses_all_to_all_single(
+            output, input_, async_op=async_op, stream=stream
+        )
+
+    return dist.all_to_all_single(output, input_, group=group, async_op=async_op)
+
+
 def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
     seq_world_size = dist.get_world_size(group)
 
@@ -70,7 +91,7 @@ def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
         post_all2all_fun = post_all2all(local_seq_2_local_head, seq_world_size)
 
     output = torch.empty_like(input_t)
-    dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
+    _all_to_all_single(output, input_t, group=group, async_op=async_op)
 
     res = post_all2all_fun(output)
     return res
@@ -140,8 +161,12 @@ def async_a2a_communicate(
         for i in range(len(a2a_inputs) + 2):
             if 0 < i < len(a2a_inputs) + 1:
                 a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
+                a2a_reqs[i - 1] = _all_to_all_single(
+                    a2a_outputs[i - 1],
+                    a2a_inputs[i - 1],
+                    group=cp_group,
+                    async_op=True,
+                    stream=cp_stream,
                 )
                 a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
             if i > 1:
@@ -156,8 +181,12 @@ def async_a2a_communicate(
         for i in range(len(a2a_inputs) + 2):
             if 0 < i < len(a2a_inputs) + 1:
                 a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
+                a2a_reqs[i - 1] = _all_to_all_single(
+                    a2a_outputs[i - 1],
+                    a2a_inputs[i - 1],
+                    group=cp_group,
+                    async_op=True,
+                    stream=cp_stream,
                 )
                 a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
             if i < len(a2a_inputs):

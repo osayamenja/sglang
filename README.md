@@ -22,6 +22,40 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+---
+
+## Install This Fork
+
+This fork integrates [Purlin](https://pypi.org/project/purlin/) as an SGLang
+communication backend. The installer supports Ubuntu with a CUDA 12 or CUDA 13
+toolkit and installs the tested `purlin==0.6.0` release.
+
+From the repository root, run:
+
+```bash
+bash scripts/install_purlin.sh
+```
+
+The script installs the required Ubuntu build packages, Rust, `uv`, a managed
+Python 3.12 environment in `.venv`, Purlin, the matching CUDA dependencies, and
+the `sglang[diffusion]` dependencies needed for image and video generation. It
+detects CUDA from `nvcc`. To require a particular toolkit version, use
+`--cuda 12` or `--cuda 13`; the selected `nvcc` must match.
+
+After installation, activate the environment and verify both the core and
+diffusion CLIs:
+
+```bash
+source .venv/bin/activate
+sglang version
+sglang generate --help
+```
+
+Enable Purlin when starting a server with `sglang serve --enable-purlin ...`.
+Run `bash scripts/install_purlin.sh --help` for all installer options.
+
+---
+
 ## News
 - [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
 - [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).

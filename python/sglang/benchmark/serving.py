@@ -107,6 +107,8 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    send_time: float = 0.0
+    finish_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -702,6 +704,7 @@ async def async_request_sglang_generate(
         most_recent_timestamp = st
         last_output_len = 0
         try:
+            output.send_time = time.perf_counter()
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
@@ -762,6 +765,7 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
+                    output.finish_time = time.perf_counter()
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -1884,6 +1888,8 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "send_times": [output.send_time for output in outputs],
+        "finish_times": [output.finish_time for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
