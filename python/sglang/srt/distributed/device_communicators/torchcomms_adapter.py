@@ -23,13 +23,10 @@ def is_torchcomms_supported_device(device: torch.device) -> bool:
 
 
 def _torchcomms_install_error(error: BaseException) -> ImportError:
-    cuda_version = (torch.version.cuda or "CUDA").replace(".", "")
     install_error = ImportError(
-        "--enable-torchcomms requires an official torchcomms wheel with the "
-        f"NCCLX backend that is compatible with this PyTorch build. For CUDA "
-        f"{torch.version.cuda or 'unknown'}, install it from "
-        f"https://download.pytorch.org/whl/cu{cuda_version}. The package named "
-        "torchcomms on PyPI is only a placeholder."
+        "--enable-torchcomms requires TorchComms built with the NCCLX backend "
+        "against this PyTorch/CUDA environment. Run scripts/install_purlin.sh "
+        "from this checkout to install the pinned source revision."
     )
     install_error.__cause__ = error
     return install_error
@@ -49,7 +46,7 @@ def _load_torchcomms() -> Any:
         TORCHCOMMS_BACKEND
     ):
         raise RuntimeError(
-            "--enable-torchcomms requires a torchcomms wheel built with the "
+            "--enable-torchcomms requires TorchComms built with the "
             f"{TORCHCOMMS_BACKEND!r} backend."
         )
 

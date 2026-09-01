@@ -12,7 +12,8 @@ readonly SGL_KERNEL_VERSION="0.4.6.post1"
 readonly TORCH_VERSION="2.13.0"
 readonly TORCHAUDIO_VERSION="2.11.0"
 readonly TORCHVISION_VERSION="0.28.0"
-readonly MSCCLPP_VERSION="sglang-v0.9.1"
+readonly MSCCLPP_VERSION="0.10.0"
+readonly MSCCLPP_GIT_TAG="v${MSCCLPP_VERSION}"
 readonly TORCHCOMMS_GIT_REPOSITORY="https://github.com/meta-pytorch/torchcomms.git"
 readonly TORCHCOMMS_GIT_REVISION="6288fc4d658f2b165623eb649c82149e82d2056b"
 readonly TORCHCOMMS_CUDA_ARCH_LIST="8.0;9.0;10.0a;10.3a"
@@ -342,6 +343,18 @@ log "Building TorchComms/NCCLX for sm_80, sm_90, sm_100a, and sm_103a"
 "${UV_PIP[@]}" packaging pyyaml setuptools wheel
 CUDA_HOME="$(cd "$(dirname "$(readlink -f "$(command -v nvcc)")")/.." && pwd)"
 readonly CUDA_HOME
+TORCHCOMMS_THIRD_PARTY_DIR="/tmp/third-party"
+TORCHCOMMS_THIRD_PARTY_WAS_PRESENT=0
+if [[ -e "${TORCHCOMMS_THIRD_PARTY_DIR}" ]]; then
+    TORCHCOMMS_THIRD_PARTY_WAS_PRESENT=1
+fi
+cleanup_torchcomms_third_party() {
+    if ((TORCHCOMMS_THIRD_PARTY_WAS_PRESENT == 0)) && \
+        [[ -d "${TORCHCOMMS_THIRD_PARTY_DIR}" ]]; then
+        find "${TORCHCOMMS_THIRD_PARTY_DIR}" -depth -delete
+    fi
+}
+trap cleanup_torchcomms_third_party EXIT
 (
     export CMAKE_BUILD_PARALLEL_LEVEL="${TORCHCOMMS_BUILD_JOBS:-$(nproc)}"
     export CMAKE_BUILD_TYPE=Release
@@ -360,6 +373,8 @@ readonly CUDA_HOME
     "${UV_PIP[@]}" --reinstall --no-build-isolation --no-deps \
         "${TORCHCOMMS_SOURCE_DIR}"
 )
+cleanup_torchcomms_third_party
+trap - EXIT
 
 CURRENT_STEP="MSCCL++ installation"
 log "Installing MSCCL++ ${MSCCLPP_VERSION}"
@@ -370,10 +385,10 @@ cleanup_mscclpp_source() {
     fi
 }
 trap cleanup_mscclpp_source EXIT
-git clone --depth 1 --branch "${MSCCLPP_VERSION}" \
+git clone --depth 1 --branch "${MSCCLPP_GIT_TAG}" \
     https://github.com/microsoft/mscclpp.git "${MSCCLPP_SOURCE_DIR}"
-CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
-    "${UV_PIP[@]}" "${MSCCLPP_SOURCE_DIR}[cuda${CUDA_MAJOR}]"
+"${UV_PIP[@]}" -Ccmake.define.MSCCLPP_USE_IB=OFF \
+    "${MSCCLPP_SOURCE_DIR}[cuda${CUDA_MAJOR}]"
 cleanup_mscclpp_source
 trap - EXIT
 
@@ -382,7 +397,7 @@ log "Verifying the installation"
 EXPECTED_ACCELERATE_VERSION="${ACCELERATE_VERSION}" \
 EXPECTED_CUDA_MAJOR="${CUDA_MAJOR}" EXPECTED_DATASETS_VERSION="${DATASETS_VERSION}" \
 EXPECTED_FSSPEC_VERSION="${FSSPEC_VERSION}" EXPECTED_PURLIN_VERSION="${PURLIN_VERSION}" \
-EXPECTED_MSCCLPP_VERSION="${MSCCLPP_VERSION#sglang-v}" \
+EXPECTED_MSCCLPP_VERSION="${MSCCLPP_VERSION}" \
     "${PYTHON_BIN}" <<'PY'
 import importlib.metadata
 import os

@@ -35,7 +35,7 @@ This fork integrates [Purlin](https://pypi.org/project/purlin/),
 [torchcomms](https://github.com/meta-pytorch/torchcomms), and
 [MSCCL++](https://github.com/microsoft/mscclpp) as SGLang communication
 backends. The installer supports Ubuntu with a CUDA 12.9 or CUDA 13 toolkit and
-installs the tested `purlin==0.6.0`, MSCCL++ `sglang-v0.9.1`, and a pinned
+installs the tested `purlin==0.6.0`, MSCCL++ `v0.10.0`, and a pinned
 TorchComms/NCCLX source revision.
 
 From the repository root, run:
