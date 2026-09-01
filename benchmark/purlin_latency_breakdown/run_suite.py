@@ -565,7 +565,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cuda-graph-backend-prefill",
         choices=("breakable", "tc_piecewise", "disabled"),
-        help="Explicit prefill CUDA-graph backend passed to the server.",
+        default="breakable",
+        help="Prefill CUDA-graph backend passed to the server.",
     )
     parser.add_argument(
         "--cuda-graph-bs-prefill",

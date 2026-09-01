@@ -4,6 +4,7 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,9 +14,31 @@ BENCHMARK_DIR = (
 sys.path.insert(0, str(BENCHMARK_DIR))
 
 import analyze_full_trace as trace  # noqa: E402
+import run_suite as suite  # noqa: E402
 import summarize_results as summary  # noqa: E402
 
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestRunSuiteDefaults(unittest.TestCase):
+    def test_prefill_cuda_graph_defaults_to_breakable(self):
+        argv = [
+            "run_suite.py",
+            "--model",
+            "test-model",
+            "--tp",
+            "2",
+            "--output-dir",
+            "test-output",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = suite.parse_args()
+
+        self.assertEqual(args.cuda_graph_backend_prefill, "breakable")
+        self.assertTrue(args.require_prefill_cuda_graph)
+        command = suite.common_server_command(args, "baseline")
+        option_index = command.index("--cuda-graph-backend-prefill")
+        self.assertEqual(command[option_index + 1], "breakable")
 
 
 def _rank_step(

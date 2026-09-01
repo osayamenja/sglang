@@ -183,8 +183,8 @@ The following translates the B300 server configuration for
 
 `--enable-dp-attention` and `--trust-remote-code` are enabled by default, so
 they need not be repeated. The runner also defaults to host `0.0.0.0`, port
-`30000`, CUDA-graph max decode batch size `256`, and watchdog timeout `3600`;
-they are written explicitly above to make the translation auditable.
+`30000`, breakable prefill CUDA graphs, CUDA-graph max decode batch size `256`,
+and watchdog timeout `3600`.
 
 The attention-backend distinction is intentional:
 
@@ -209,16 +209,18 @@ server-side prefill token count. This matters when a prefill graph is captured
 for specific token counts. Use `--no-tokenize-prompt` only for a deliberate
 text-tokenization experiment.
 
-For a prefill-graph experiment, pass the backend and its captured token sizes
-directly through the suite, for example:
+The suite defaults to the breakable prefill CUDA-graph backend. To select exact
+captured token sizes, pass them directly through the suite, for example:
 
 ```bash
---cuda-graph-backend-prefill breakable --cuda-graph-bs-prefill 1024
+--cuda-graph-bs-prefill 1024
 ```
 
-An explicitly selected non-disabled prefill backend also enables measured-graph
-validation: analysis fails if any active measured prefill has no CUDA graph
-nodes. `--no-require-prefill-cuda-graph` is available for deliberate fallback
+Use `--cuda-graph-backend-prefill disabled` to disable prefill graphs or
+`--cuda-graph-backend-prefill tc_piecewise` to select that backend. Any
+non-disabled backend enables measured-graph validation: analysis fails if any
+active measured prefill has no CUDA graph nodes.
+`--no-require-prefill-cuda-graph` is available for deliberate fallback
 experiments.
 
 ## What the runner does
