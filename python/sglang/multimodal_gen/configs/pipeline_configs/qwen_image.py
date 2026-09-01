@@ -435,9 +435,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         )
         if num_outputs > 1:
             txt_seq_lens = [
-                seq_len
-                for seq_len in txt_seq_lens
-                for _ in range(num_outputs)
+                seq_len for seq_len in txt_seq_lens for _ in range(num_outputs)
             ]
         encoder_hidden_states_mask = self._prepare_encoder_hidden_states_mask(
             batch,
@@ -483,10 +481,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             mask = masks_by_encoder[encoder_index]
             num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
             prompt_batch_size = batch_size // num_outputs
-            if (
-                num_outputs > 1
-                and mask.shape == (prompt_batch_size, text_seq_len)
-            ):
+            if num_outputs > 1 and mask.shape == (prompt_batch_size, text_seq_len):
                 mask = mask.repeat_interleave(num_outputs, dim=0)
             if mask.shape != (batch_size, text_seq_len):
                 raise ValueError(

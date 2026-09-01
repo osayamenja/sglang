@@ -24,10 +24,13 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
-from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     all_to_all as purlin_all_to_all,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     all_to_all_v as purlin_all_to_all_v,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     are_aligned_byte_sizes,
     can_use_purlin,
     element_counts_to_bytes,
@@ -35,6 +38,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils
     initialize_purlin_handle,
     is_purlin_supported_device,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,

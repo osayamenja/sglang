@@ -6,6 +6,9 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class FakePyNcclCommunicator:

@@ -8,12 +8,16 @@ import torch
 from torch.distributed import ProcessGroup
 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
-    DistributedAutograd,
     DeviceCommunicatorBase,
+    DistributedAutograd,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     all_to_all,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     all_to_all_v as purlin_all_to_all_v,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils import (
     are_aligned_byte_sizes,
     can_use_purlin,
     element_counts_to_bytes,

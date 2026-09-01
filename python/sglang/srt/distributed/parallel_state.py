@@ -94,6 +94,7 @@ _PURLIN_SPLIT_ALIGNMENT = 16
 def _are_purlin_byte_sizes_aligned(sizes: List[int]) -> bool:
     return all(size % _PURLIN_SPLIT_ALIGNMENT == 0 for size in sizes)
 
+
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
@@ -1525,10 +1526,7 @@ class GroupCoordinator:
             output_list.append(output_tensor)
             size_list.append(s)
 
-        if all(
-            self._can_use_purlin(inp, out)
-            for inp, out in zip(input_, output_list)
-        ):
+        if all(self._can_use_purlin(inp, out) for inp, out in zip(input_, output_list)):
             can_use_purlin_for_sizes = all(
                 s is None
                 or _are_purlin_byte_sizes_aligned(self._sizes_in_bytes(s, inp))

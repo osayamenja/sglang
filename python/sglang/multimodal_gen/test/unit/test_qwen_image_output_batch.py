@@ -29,9 +29,7 @@ class TestQwenImageOutputBatch(unittest.TestCase):
         )
 
         expanded = config.get_pos_prompt_embeds(batch)[0]
-        torch.testing.assert_close(
-            expanded, prompt_embeds.repeat_interleave(2, dim=0)
-        )
+        torch.testing.assert_close(expanded, prompt_embeds.repeat_interleave(2, dim=0))
 
         kwargs = config.prepare_pos_cond_kwargs(
             batch, torch.device("cpu"), rotary_emb=None, dtype=torch.bfloat16

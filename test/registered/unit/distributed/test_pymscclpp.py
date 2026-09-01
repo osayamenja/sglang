@@ -11,9 +11,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _communicator(world_size: int):
-    comm = pymscclpp.PyMscclppCommunicator.__new__(
-        pymscclpp.PyMscclppCommunicator
-    )
+    comm = pymscclpp.PyMscclppCommunicator.__new__(pymscclpp.PyMscclppCommunicator)
     comm.world_size = world_size
     comm.device = torch.device("cuda:0")
     return comm
