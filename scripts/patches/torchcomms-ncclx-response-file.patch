@@ -1,0 +1,19 @@
+diff --git a/comms/ncclx/v2_30/src/device/Makefile b/comms/ncclx/v2_30/src/device/Makefile
+--- a/comms/ncclx/v2_30/src/device/Makefile
++++ b/comms/ncclx/v2_30/src/device/Makefile
+@@ -169,11 +169,13 @@ $(OBJDIR)/genobj/symmetric/%.d: $(OBJDIR)/gensrc/symmetric/%
+
+ # Device link: combine all device .o (incl. common.cu.o with GIN symbol) into device_glue.o
+ $(DEVGLUE_OBJ): $(LIB_OBJS)
+-	$(NVCC) $(NVCUFLAGS) -dlink $^ -o $@
++	$(file >$(OBJDIR)/device_glue.rsp,$^)
++	$(NVCC) $(NVCUFLAGS) -dlink --options-file $(OBJDIR)/device_glue.rsp -o $@
+
+ # Manifest lists device objs for src/Makefile; they get linked into libnccl.so so tests can resolve device symbols
+ $(MANIFEST): $(LIB_OBJS) $(DEVGLUE_OBJ)
+-	@echo $^ > $@
++	$(file >$@,$^)
++	@:
+
+ -include $(wildcard $(OBJDIR)/*.d)
+ -include $(wildcard $(OBJDIR)/genobj/*.d)
