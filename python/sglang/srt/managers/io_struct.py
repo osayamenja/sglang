@@ -1660,6 +1660,7 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    empty_cache: bool = True
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -2105,10 +2106,15 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
+    MARK = 3
 
 
 class ProfileReq(BaseReq, kw_only=True):
     req_type: ProfileReqType = ProfileReqType.START_PROFILE
+    # Measurement-boundary marker metadata. These fields are used only when
+    # req_type is MARK.
+    marker_phase: Optional[Literal["begin", "end"]] = None
+    run_id: Optional[str] = None
     # The output directory
     output_dir: Optional[str] = None
     # Specify the steps to start the profiling

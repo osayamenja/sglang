@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import fastapi
 
@@ -302,15 +302,18 @@ class TokenizerControlMixin:
         )
 
     async def flush_cache(
-        self: TokenizerManager, timeout_s: Optional[float] = None
+        self: TokenizerManager,
+        timeout_s: Optional[float] = None,
+        empty_cache: bool = True,
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
-        if result.success and self.mm_processor is not None:
+        results = await self.flush_cache_communicator(
+            FlushCacheReqInput(timeout_s=timeout_s, empty_cache=empty_cache)
+        )
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        if all_success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
-        return result
+        return FlushCacheReqOutput(success=all_success, message=all_message)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -400,11 +403,23 @@ class TokenizerControlMixin:
         req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
+    async def profile_marker(
+        self: TokenizerManager, run_id: str, phase: Literal["begin", "end"]
+    ):
+        self.auto_create_handle_loop()
+        req = ProfileReq(
+            req_type=ProfileReqType.MARK,
+            run_id=run_id,
+            marker_phase=phase,
+        )
+        return await self._execute_profile(req)
+
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
-        result = (await self.profile_communicator(req))[0]
-        if not result.success:
-            raise RuntimeError(result.message)
-        return result
+        results = await self.profile_communicator(req)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        if not all_success:
+            raise RuntimeError(all_message)
+        return ProfileReqOutput(success=True, message=all_message)
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()

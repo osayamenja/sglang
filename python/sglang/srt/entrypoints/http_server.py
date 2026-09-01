@@ -36,6 +36,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Union,
 )
@@ -979,9 +980,13 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+async def flush_cache(
+    timeout: float = Query(0.0, ge=0.0), empty_cache: bool = Query(True)
+):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, empty_cache=empty_cache
+    )
     if ret.success:
         content = (
             "Cache flushed.\nPlease check backend logs for more details. "
@@ -1188,6 +1193,17 @@ async def stop_profile_async():
         content="Stop profiling. This will take some time.\n",
         status_code=200,
     )
+
+
+@app.api_route("/profile_marker", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def profile_marker_async(
+    run_id: str = Query(..., min_length=1),
+    phase: Literal["begin", "end"] = Query(...),
+):
+    """Emit an all-scheduler NVTX measurement-boundary marker."""
+    await _global_state.tokenizer_manager.profile_marker(run_id=run_id, phase=phase)
+    return Response(content=f"Profile marker {phase} emitted.\n", status_code=200)
 
 
 @app.api_route("/set_trace_level", methods=["GET", "POST"])

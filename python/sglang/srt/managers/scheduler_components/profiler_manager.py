@@ -23,6 +23,7 @@ from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_e
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_mark
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -477,5 +478,32 @@ class SchedulerProfilerManager:
                     recv_req.detailed_annotations,
                 )
                 return self._start_profile()
-        else:
+        if recv_req.req_type == ProfileReqType.STOP_PROFILE:
             return self._stop_profile()
+        if recv_req.req_type == ProfileReqType.MARK:
+            if not recv_req.run_id or recv_req.marker_phase not in ("begin", "end"):
+                return ProfileReqOutput(
+                    success=False,
+                    message="Profile MARK requires run_id and phase=begin|end.",
+                )
+            try:
+                scheduler_nvtx_mark(
+                    {
+                        "run_id": recv_req.run_id,
+                        "phase": recv_req.marker_phase,
+                        "gpu_id": self.ps.gpu_id,
+                        "tp_rank": self.ps.tp_rank,
+                        "pp_rank": self.ps.pp_rank,
+                        "dp_rank": self.ps.dp_rank,
+                        "attn_dp_rank": self.ps.attn_dp_rank,
+                        "attn_tp_rank": self.ps.attn_tp_rank,
+                        "moe_ep_rank": self.ps.moe_ep_rank,
+                    }
+                )
+            except Exception as exc:
+                return ProfileReqOutput(success=False, message=str(exc))
+            return ProfileReqOutput(success=True, message="Marker emitted.")
+        return ProfileReqOutput(
+            success=False,
+            message=f"Unsupported profile request type: {recv_req.req_type!r}",
+        )

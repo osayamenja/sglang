@@ -1,16 +1,17 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput
+from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
@@ -37,7 +38,17 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=None))
 
         self.assertFalse(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(empty_cache=True)
+
+    def test_immediate_flush_propagates_empty_cache_false(self):
+        scheduler = self._new_scheduler()
+
+        output = scheduler.flush_wrapper.handle(
+            FlushCacheReqInput(timeout_s=None, empty_cache=False)
+        )
+
+        self.assertTrue(output.success)
+        scheduler.flush_cache.assert_called_once_with(empty_cache=False)
 
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
@@ -47,7 +58,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
         self.assertTrue(output.success)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(empty_cache=True)
 
     def test_defers_when_busy(self):
         """Positive timeout + busy → defers, returns None."""
@@ -88,9 +99,19 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper.check_pending()
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
-        scheduler.flush_cache.assert_called_once()
+        scheduler.flush_cache.assert_called_once_with(empty_cache=True)
         out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertTrue(out.success)
+
+    def test_pending_flush_propagates_empty_cache_false(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle.return_value = True
+        req = FlushCacheReqInput(timeout_s=1.0, empty_cache=False)
+        scheduler.flush_wrapper._pending = (req, 111.0)
+
+        scheduler.flush_wrapper.check_pending()
+
+        scheduler.flush_cache.assert_called_once_with(empty_cache=False)
 
     def test_pending_flush_expires_on_timeout(self):
         scheduler = self._new_scheduler()
@@ -121,6 +142,28 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+
+class TestTokenizerFlushCache(unittest.IsolatedAsyncioTestCase):
+    async def test_any_failed_dp_rank_makes_aggregate_fail(self):
+        manager = MagicMock()
+        manager.auto_create_handle_loop = MagicMock()
+        manager.flush_cache_communicator = AsyncMock(
+            return_value=[
+                FlushCacheReqOutput(success=True, message="rank 0 ok"),
+                FlushCacheReqOutput(success=False, message="rank 1 busy"),
+            ]
+        )
+
+        output = await TokenizerControlMixin.flush_cache(
+            manager, timeout_s=5.0, empty_cache=False
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("rank 1 busy", output.message)
+        request = manager.flush_cache_communicator.await_args.args[0]
+        self.assertEqual(request.timeout_s, 5.0)
+        self.assertFalse(request.empty_cache)
 
 
 if __name__ == "__main__":

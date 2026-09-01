@@ -25,6 +25,7 @@ Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
+import json
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
@@ -54,6 +55,8 @@ NVTX_AVAILABLE = _nvtx_module is not None
 # package is importable. The record_function path is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
+
+MEASUREMENT_MARKER_PREFIX = "sglang.measurement:"
 
 # Default nvtx colors for statically-named spans (only used on the nvtx path).
 _NVTX_COLOR_MAP = {
@@ -117,3 +120,20 @@ def profile_method(
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+
+
+def scheduler_nvtx_mark(payload: dict) -> None:
+    """Emit a scheduler-scoped instantaneous NVTX marker.
+
+    Measurement markers must never silently disappear: callers use their
+    presence to define trace boundaries and scheduler topology.
+    """
+    if not NVTX_SCHEDULER_ENABLED:
+        raise RuntimeError(
+            "Scheduler NVTX markers are disabled. Set "
+            "SGLANG_ENABLE_NVTX_SCHEDULER=1 and install the nvtx package."
+        )
+    message = MEASUREMENT_MARKER_PREFIX + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
+    _nvtx_module.mark(message, color="yellow")

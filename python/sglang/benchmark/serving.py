@@ -53,6 +53,12 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
+_FLUSH_CACHE_OVERALL_TIMEOUT_SECONDS = 180.0
+_FLUSH_CACHE_SERVER_TIMEOUT_SECONDS = 30.0
+_FLUSH_CACHE_REQUEST_TIMEOUT_SECONDS = 35.0
+_FLUSH_CACHE_RETRY_INTERVAL_SECONDS = 0.25
+_MEASUREMENT_PRIMER_PROMPT = "SGLang measurement profiler primer."
+
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
@@ -115,6 +121,8 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    cache_metadata_seen: bool = False
+    dp_rank: Optional[int] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -139,6 +147,64 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def flush_cache_or_raise(
+    base_url: str,
+    *,
+    empty_cache: bool,
+    overall_timeout_s: float = _FLUSH_CACHE_OVERALL_TIMEOUT_SECONDS,
+    server_timeout_s: float = _FLUSH_CACHE_SERVER_TIMEOUT_SECONDS,
+    request_timeout_s: float = _FLUSH_CACHE_REQUEST_TIMEOUT_SECONDS,
+    retry_interval_s: float = _FLUSH_CACHE_RETRY_INTERVAL_SECONDS,
+    _post=requests.post,
+    _monotonic=time.monotonic,
+    _sleep=time.sleep,
+) -> None:
+    """Block until every scheduler rank flushes or a bounded deadline expires."""
+    if overall_timeout_s <= 0 or server_timeout_s <= 0 or request_timeout_s <= 0:
+        raise ValueError("Flush-cache timeouts must be positive")
+
+    deadline = _monotonic() + overall_timeout_s
+    final_status = "not attempted"
+    final_body = ""
+    while True:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
+        try:
+            response = _post(
+                base_url + "/flush_cache",
+                params={
+                    "timeout": server_timeout_s,
+                    "empty_cache": str(empty_cache).lower(),
+                },
+                headers=get_auth_headers(),
+                timeout=max(0.001, min(request_timeout_s, remaining)),
+            )
+        except requests.RequestException as exc:
+            final_status = "transport error"
+            final_body = str(exc)
+        else:
+            final_status = str(response.status_code)
+            final_body = response.text
+            if response.status_code == 200:
+                return
+            if response.status_code != 400:
+                raise RuntimeError(
+                    "Flush cache failed with non-retriable HTTP status "
+                    f"{final_status}: {final_body}"
+                )
+
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            break
+        _sleep(min(retry_interval_s, remaining))
+
+    raise RuntimeError(
+        "Flush cache did not succeed before its deadline; final status "
+        f"{final_status}: {final_body}"
+    )
 
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
@@ -247,13 +313,40 @@ def _extract_cache_from_sglext(data, output):
     """Extract cache hit details from sglext in OAI-compatible responses."""
     sglext = data.get("sglext") or {}
     details = sglext.get("cached_tokens_details")
-    if details:
-        output.cached_tokens = (
+    if details is not None:
+        cached_tokens = (
             (details.get("device") or 0)
             + (details.get("host") or 0)
             + (details.get("storage") or 0)
         )
+        output.cached_tokens = max(output.cached_tokens, cached_tokens)
         output.cached_tokens_details = details
+        output.cache_metadata_seen = True
+
+
+def _extract_sglang_meta_info(data: Dict[str, Any], output: RequestFuncOutput) -> None:
+    """Record cache and routing metadata from every native SGLang chunk."""
+    meta_info = data.get("meta_info") or {}
+    if "cached_tokens" in meta_info:
+        cached_tokens = meta_info["cached_tokens"]
+        if not isinstance(cached_tokens, int) or isinstance(cached_tokens, bool):
+            raise ValueError(f"Invalid cached_tokens metadata: {cached_tokens!r}")
+        output.cached_tokens = max(output.cached_tokens, cached_tokens)
+        output.cache_metadata_seen = True
+    if "cached_tokens_details" in meta_info:
+        output.cached_tokens_details = meta_info["cached_tokens_details"]
+
+    if "dp_rank" not in meta_info or meta_info["dp_rank"] is None:
+        return
+    dp_rank = meta_info["dp_rank"]
+    if not isinstance(dp_rank, int) or isinstance(dp_rank, bool) or dp_rank < 0:
+        raise ValueError(f"Invalid dp_rank metadata: {dp_rank!r}")
+    if output.dp_rank is not None and output.dp_rank != dp_rank:
+        raise ValueError(
+            "SGLang response changed DP rank across stream chunks: "
+            f"{output.dp_rank} -> {dp_rank}"
+        )
+    output.dp_rank = dp_rank
 
 
 # set ignore_eos True by default
@@ -329,8 +422,7 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            if getattr(args, "cache_report", False):
-                                _extract_cache_from_sglext(data, output)
+                            _extract_cache_from_sglext(data, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -498,8 +590,7 @@ async def async_request_openai_chat_completions(
                         output.spec_cap_lens_histogram = (
                             _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
-                        if getattr(args, "cache_report", False):
-                            _extract_cache_from_sglext(response_json, output)
+                        _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -519,8 +610,7 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                                if getattr(args, "cache_report", False):
-                                    _extract_cache_from_sglext(data, output)
+                                _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
                                 if not choices:
@@ -733,15 +823,11 @@ async def async_request_sglang_generate(
                                     "spec_accept_length"
                                 ]
 
+                            _extract_sglang_meta_info(data, output)
+
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if getattr(args, "cache_report", False):
-                                _meta = data.get("meta_info") or {}
-                                output.cached_tokens = _meta.get("cached_tokens", 0)
-                                output.cached_tokens_details = _meta.get(
-                                    "cached_tokens_details"
-                                )
 
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
@@ -882,7 +968,9 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(url=api_url, json=body) as response:
+            async with session.post(
+                url=api_url, json=body, headers=get_auth_headers()
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -896,6 +984,43 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
             output.error = "".join(traceback.format_exception(*exc_info))
 
     return output
+
+
+async def async_request_profile_marker(
+    base_url: str, run_id: str, phase: str
+) -> RequestFuncOutput:
+    async with _create_bench_client_session() as session:
+        output = RequestFuncOutput()
+        try:
+            async with session.post(
+                url=base_url + "/profile_marker",
+                params={"run_id": run_id, "phase": phase},
+                headers=get_auth_headers(),
+            ) as response:
+                if response.status == 200:
+                    output.success = True
+                else:
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
+        except Exception:
+            output.error = "".join(traceback.format_exception(*sys.exc_info()))
+    return output
+
+
+async def profile_request_or_raise(api_url: str, action: str) -> None:
+    output = await async_request_profile(api_url)
+    if not output.success:
+        raise RuntimeError(f"Failed to {action} profiler: {output.error}")
+
+
+async def profile_marker_or_raise(base_url: str, run_id: str, phase: str) -> None:
+    output = await async_request_profile_marker(base_url, run_id, phase)
+    if not output.success:
+        raise RuntimeError(
+            f"Failed to emit measurement {phase} marker for {run_id}: "
+            f"{output.error}"
+        )
 
 
 def _build_profile_urls(
@@ -935,8 +1060,9 @@ async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> No
         if profile_output.success:
             print(f"Profiler {action_past} for {worker_type} worker at {url}")
         else:
-            print(
-                f"Failed to {mode} profiler for {worker_type} worker at {url}: {profile_output.error}"
+            raise RuntimeError(
+                f"Failed to {mode} profiler for {worker_type} worker at {url}: "
+                f"{profile_output.error}"
             )
 
 
@@ -1338,6 +1464,131 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+async def run_warmup_requests(
+    limited_request_func: Callable,
+    test_input: RequestFuncInput,
+    warmup_requests: int,
+    *,
+    is_multi_turn: bool,
+) -> List[RequestFuncOutput]:
+    """Run bounded warmups and report every request or turn failure."""
+    tasks = [
+        asyncio.create_task(
+            limited_request_func(request_func_input=test_input, pbar=None)
+        )
+        for _ in range(warmup_requests)
+    ]
+    raw_outputs = await asyncio.gather(*tasks, return_exceptions=True)
+
+    outputs: List[RequestFuncOutput] = []
+    failures: List[str] = []
+    for request_index, raw_output in enumerate(raw_outputs):
+        if isinstance(raw_output, BaseException):
+            failures.append(f"request {request_index}: {raw_output}")
+            continue
+        request_outputs = raw_output if is_multi_turn else [raw_output]
+        for turn_index, output in enumerate(request_outputs):
+            outputs.append(output)
+            if not output.success:
+                location = f"request {request_index}"
+                if is_multi_turn:
+                    location += f" turn {turn_index}"
+                failures.append(f"{location}: {output.error or 'unknown error'}")
+
+    if failures:
+        raise ValueError("Warmup failed:\n  " + "\n  ".join(failures))
+    return outputs
+
+
+async def run_measurement_primers(
+    limited_request_func: Callable,
+    *,
+    api_url: str,
+    model_id: str,
+    tokenizer: PreTrainedTokenizerBase,
+    lora_name: Optional[str],
+    extra_request_body: Dict[str, Any],
+    dp_size: int,
+) -> List[RequestFuncOutput]:
+    """Send one identical two-token request sequentially to every DP rank."""
+    prompt_len = len(
+        tokenizer.encode(_MEASUREMENT_PRIMER_PROMPT, add_special_tokens=False)
+    )
+    outputs: List[RequestFuncOutput] = []
+    failures: List[str] = []
+    for dp_rank in range(dp_size):
+        primer_input = RequestFuncInput(
+            model=model_id,
+            prompt=_MEASUREMENT_PRIMER_PROMPT,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=2,
+            lora_name=lora_name,
+            image_data=None,
+            extra_request_body={
+                **extra_request_body,
+                "routed_dp_rank": dp_rank,
+            },
+        )
+        output = await limited_request_func(request_func_input=primer_input, pbar=None)
+        if isinstance(output, list):
+            failures.append(f"DP rank {dp_rank}: unexpected multi-turn output")
+            continue
+        outputs.append(output)
+        if not output.success:
+            failures.append(
+                f"DP rank {dp_rank}: {output.error or 'unknown request error'}"
+            )
+        elif output.dp_rank != dp_rank:
+            failures.append(
+                f"DP rank {dp_rank}: response reported dp_rank={output.dp_rank!r}"
+            )
+
+    if failures:
+        raise ValueError("Measurement primer failed:\n  " + "\n  ".join(failures))
+    return outputs
+
+
+def validate_measured_outputs(
+    outputs: List[RequestFuncOutput],
+    *,
+    require_zero_cached_tokens: bool,
+    require_dp_rank: bool,
+) -> None:
+    failures: List[str] = []
+    for request_index, output in enumerate(outputs):
+        if not output.success:
+            failures.append(
+                f"request {request_index} failed: {output.error or 'unknown error'}"
+            )
+            continue
+        if require_zero_cached_tokens:
+            if not output.cache_metadata_seen:
+                failures.append(
+                    f"request {request_index} did not report cached_tokens metadata"
+                )
+            elif output.cached_tokens != 0:
+                failures.append(
+                    f"request {request_index} reported "
+                    f"cached_tokens={output.cached_tokens}"
+                )
+        if require_dp_rank and output.dp_rank is None:
+            failures.append(f"request {request_index} did not report a DP rank")
+
+    if failures:
+        raise ValueError(
+            "Measured request validation failed:\n  " + "\n  ".join(failures)
+        )
+
+
+async def run_timed_measurement(operation: Callable, _perf_counter=time.perf_counter):
+    """Time only request scheduling and completion, excluding later cleanup."""
+    start_time = _perf_counter()
+    result = await operation()
+    end_time = _perf_counter()
+    return result, start_time, end_time
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1362,6 +1613,10 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    measurement_run_id: Optional[str] = None,
+    measurement_dp_size: int = 0,
+    require_zero_cached_tokens: bool = False,
+    require_dp_rank: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1384,6 +1639,28 @@ async def benchmark(
         )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+
+    measurement_protocol = measurement_run_id is not None or measurement_dp_size > 0
+    if measurement_protocol:
+        if backend != "sglang":
+            raise ValueError(
+                "The measurement marker/primer protocol requires --backend sglang"
+            )
+        if not measurement_run_id or measurement_dp_size < 1:
+            raise ValueError(
+                "Measurement protocol requires a non-empty run ID and positive DP size"
+            )
+        if not flush_cache:
+            raise ValueError("Measurement protocol requires --flush-cache")
+        if pd_separated:
+            raise ValueError("Measurement protocol does not support PD-separated mode")
+        if (
+            getattr(args, "profile_steps", None) is not None
+            or getattr(args, "profile_num_steps", None) is not None
+        ):
+            raise ValueError(
+                "Measurement protocol requires explicit profiler shutdown, not a step limit"
+            )
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -1442,153 +1719,201 @@ async def benchmark(
         extra_request_body=extra_request_body,
     )
 
-    # Run warmup requests
-    warmup_tasks = []
-    for _ in range(warmup_requests):
-        warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
-        )
-
-    warmup_outputs = await asyncio.gather(*warmup_tasks)
-    if is_multi_turn:
-        warmup_outputs = [x for output in warmup_outputs for x in output]
-
-    # Check if at least one warmup request succeeded
-    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
-        raise ValueError(
-            "Warmup failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {warmup_outputs[0].error}"
-        )
-    else:
-        print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
-        )
+    await run_warmup_requests(
+        limited_request_func,
+        test_input,
+        warmup_requests,
+        is_multi_turn=is_multi_turn,
+    )
+    print(
+        f"Warmup completed with {warmup_requests} sequences. "
+        "Preparing main benchmark run..."
+    )
 
     # Flush cache after warmup so the measured run does not benefit from
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
-    should_flush_cache = (
+    should_flush = (
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
-    if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
-
-    time.sleep(1.0)
+    if should_flush:
+        if backend.startswith("sglang"):
+            flush_cache_or_raise(
+                base_url,
+                empty_cache=not measurement_protocol,
+                overall_timeout_s=flush_cache_timeout,
+                server_timeout_s=min(
+                    _FLUSH_CACHE_SERVER_TIMEOUT_SECONDS, flush_cache_timeout
+                ),
+            )
+        else:
+            flush_server_cache(base_url, backend, flush_cache_timeout)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
     if profile and pd_separated:
         pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
         if not pd_profile_urls:
-            print(
-                "Warning: PD separated mode requires --profile-prefill-url or --profile-decode-url"
+            raise ValueError(
+                "PD separated mode requires --profile-prefill-url or "
+                "--profile-decode-url"
             )
-            print("Skipping profiler start. Please specify worker URLs for profiling.")
 
     # Start profiler
+    profile_started = False
     if profile:
         if pd_separated:
-            if pd_profile_urls:
-                await _call_profile_pd(pd_profile_urls, "start")
+            await _call_profile_pd(pd_profile_urls, "start")
         else:
             print("Starting profiler...")
-            profile_output = await async_request_profile(
-                api_url=base_url + "/start_profile"
+            await profile_request_or_raise(base_url + "/start_profile", "start")
+            print("Profiler started")
+        profile_started = True
+
+    pbar = None
+    try:
+        if measurement_protocol:
+            print(f"Priming {measurement_dp_size} DP ranks sequentially...")
+            await run_measurement_primers(
+                limited_request_func,
+                api_url=api_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                lora_name=lora_name,
+                extra_request_body=extra_request_body,
+                dp_size=measurement_dp_size,
             )
-            if profile_output.success:
-                print("Profiler started")
+            flush_cache_or_raise(base_url, empty_cache=False)
 
-    # Run all requests
-    benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and is_mooncake
-    ):  # Assuming mooncake is mainly for sglang or similar backends
-        print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
-        request_generator = get_mooncake_request_over_time(
-            input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
-        )
-        print(
-            f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, Rounds per session: {mooncake_num_rounds}. Slowdown factor: {mooncake_slowdown_factor}"
-        )
-        pbar_total *= args.mooncake_num_rounds
-    else:
-        request_generator = get_request(input_requests, request_rate)
-
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
-
-    pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    benchmark_requests: List[DatasetRow] = []
-    async for request in request_generator:
-        benchmark_requests.append(request)
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
+        pbar_total = len(input_requests)
+        if (
+            backend == "sglang" and is_mooncake
+        ):  # Assuming mooncake is mainly for sglang or similar backends
+            print(
+                "Using time-based Mooncake request scheduler, ignoring "
+                "--request-rate."
+            )
+            request_generator = get_mooncake_request_over_time(
+                input_requests,
+                tokenizer,
+                mooncake_slowdown_factor,
+                mooncake_num_rounds,
+            )
+            print(
+                f"Starting Mooncake trace replay. Sessions: {len(input_requests)}, "
+                f"Rounds per session: {mooncake_num_rounds}. Slowdown factor: "
+                f"{mooncake_slowdown_factor}"
+            )
+            pbar_total *= args.mooncake_num_rounds
         else:
-            lora_name = None
+            request_generator = get_request(input_requests, request_rate)
 
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        # Prepare LoRA request distribution parameters
+        if lora_request_distribution == "distinct":
+            lora_idx = 0
+        elif lora_request_distribution == "skewed":
+            weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+            lora_probs = weights / np.sum(weights)
+        else:
+            lora_idx = None
+            lora_probs = None
 
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
-            api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
-        )
+        pbar = None if disable_tqdm else tqdm(total=pbar_total)
+        benchmark_requests: List[DatasetRow] = []
+        marker_emitted = False
+        measurement_started = False
+        try:
+            if profile and measurement_protocol:
+                await profile_marker_or_raise(base_url, measurement_run_id, "begin")
+                marker_emitted = True
 
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            async def schedule_and_gather_requests():
+                nonlocal lora_idx, lora_name
+                tasks: List[asyncio.Task] = []
+                async for request in request_generator:
+                    benchmark_requests.append(request)
+                    if lora_names is not None and len(lora_names) != 0:
+                        if lora_request_distribution == "uniform":
+                            lora_name = random.choice(lora_names)
+                        elif lora_request_distribution == "distinct":
+                            lora_name = lora_names[lora_idx]
+                            lora_idx = (lora_idx + 1) % len(lora_names)
+                        else:
+                            assert lora_request_distribution == "skewed", (
+                                "Unexpected lora_request_distribution: "
+                                f"{lora_request_distribution}. Expected 'skewed'."
+                            )
+                            lora_name = np.random.choice(lora_names, p=lora_probs)
+                    else:
+                        lora_name = None
+
+                    # Per-request parameters take precedence over global extras.
+                    merged_extra_body = {
+                        **extra_request_body,
+                        **request.extra_request_body,
+                    }
+                    request_func_input = RequestFuncInput(
+                        model=model_id,
+                        prompt=request.prompt,
+                        api_url=api_url,
+                        prompt_len=request.prompt_len,
+                        output_len=request.output_len,
+                        lora_name=lora_name,
+                        image_data=request.image_data,
+                        extra_request_body=merged_extra_body,
+                        timestamp=request.timestamp,
+                        routing_key=request.routing_key,
+                    )
+                    tasks.append(
+                        asyncio.create_task(
+                            limited_request_func(
+                                request_func_input=request_func_input, pbar=pbar
+                            )
+                        )
+                    )
+                return await asyncio.gather(*tasks)
+
+            measurement_started = True
+            (
+                raw_outputs,
+                benchmark_start_time,
+                benchmark_end_time,
+            ) = await run_timed_measurement(schedule_and_gather_requests)
+        finally:
+            if measurement_protocol and measurement_started:
+                try:
+                    flush_cache_or_raise(base_url, empty_cache=False)
+                finally:
+                    if marker_emitted:
+                        await profile_marker_or_raise(
+                            base_url, measurement_run_id, "end"
+                        )
+                        marker_emitted = False
+
+        outputs: List[RequestFuncOutput] = raw_outputs
+        if is_multi_turn:
+            outputs = [x for output in outputs for x in output]
+        if measurement_protocol or require_zero_cached_tokens or require_dp_rank:
+            validate_measured_outputs(
+                outputs,
+                require_zero_cached_tokens=require_zero_cached_tokens,
+                require_dp_rank=require_dp_rank,
             )
+    finally:
+        if pbar is not None:
+            pbar.close()
+        should_stop_profile = (
+            profile_started
+            and getattr(args, "profile_steps", None) is None
+            and getattr(args, "profile_num_steps", None) is None
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    if is_multi_turn:
-        outputs = [x for output in outputs for x in output]
-
-    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
-    if profile and not (
-        hasattr(args, "profile_steps") and args.profile_steps is not None
-    ):
-        if pd_separated:
-            if pd_profile_urls:
+        if should_stop_profile:
+            if pd_separated:
                 await _call_profile_pd(pd_profile_urls, "stop")
-        else:
-            if getattr(args, "profile_num_steps", None) is None:
+            else:
                 print("Stopping profiler...")
-                profile_output = await async_request_profile(
-                    api_url=base_url + "/stop_profile"
-                )
-                if profile_output.success:
-                    print("Profiler stopped")
-
-    if pbar is not None:
-        pbar.close()
+                await profile_request_or_raise(base_url + "/stop_profile", "stop")
+                print("Profiler stopped")
 
     if "sglang" in backend:
         server_info = requests.get(
@@ -1613,7 +1938,7 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_duration = benchmark_end_time - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -1807,6 +2132,7 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
+            "run_id": measurement_run_id,
             # Information
             "server_info": server_info,
             # Results
@@ -1890,6 +2216,7 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "send_times": [output.send_time for output in outputs],
         "finish_times": [output.finish_time for output in outputs],
+        "dp_ranks": [output.dp_rank for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
@@ -1977,6 +2304,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "measurement_run_id"):
+        args.measurement_run_id = None
+    if not hasattr(args, "measurement_dp_size"):
+        args.measurement_dp_size = 0
+    if not hasattr(args, "require_zero_cached_tokens"):
+        args.require_zero_cached_tokens = False
+    if not hasattr(args, "require_dp_rank"):
+        args.require_dp_rank = False
+
+    if args.require_zero_cached_tokens and not args.cache_report:
+        raise ValueError("--require-zero-cached-tokens requires --cache-report")
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2161,6 +2500,10 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            measurement_run_id=args.measurement_run_id,
+            measurement_dp_size=args.measurement_dp_size,
+            require_zero_cached_tokens=args.require_zero_cached_tokens,
+            require_dp_rank=args.require_dp_rank,
         )
     )
 
@@ -2608,6 +2951,26 @@ def cli_main():
         type=_finite_positive_float,
         default=_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
         help="Maximum seconds to wait for an SGLang server to become idle before flushing the cache",
+    )
+    parser.add_argument(
+        "--measurement-run-id",
+        help="Unique run ID stored in output and used for trace boundary markers.",
+    )
+    parser.add_argument(
+        "--measurement-dp-size",
+        type=int,
+        default=0,
+        help="Enable the latency-suite protocol and prime this many DP ranks.",
+    )
+    parser.add_argument(
+        "--require-zero-cached-tokens",
+        action="store_true",
+        help="Fail if measured requests omit cache metadata or report a cache hit.",
+    )
+    parser.add_argument(
+        "--require-dp-rank",
+        action="store_true",
+        help="Fail if a measured request does not report its serving DP rank.",
     )
     parser.add_argument(
         "--warmup-requests",
