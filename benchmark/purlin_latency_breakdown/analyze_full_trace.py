@@ -664,11 +664,42 @@ def build_step_groups(rank_steps: dict[int, list[RankStep]]) -> list[StepGroup]:
 
 
 def validate_prefill_cuda_graph_execution(
-    rank_steps: dict[int, list[RankStep]], *, required: bool
-) -> dict[int, dict[str, int]]:
-    """Audit whether active prefill steps actually replayed a CUDA graph."""
+    rank_steps: dict[int, list[RankStep]],
+    *,
+    required: bool,
+    topology: dict[int, SchedulerTopology] | None = None,
+    measured_dp_ranks: Iterable[int] | None = None,
+) -> dict[int, dict[str, int | bool]]:
+    """Audit prefill graph replay on DP groups that served measured requests."""
 
-    audit: dict[int, dict[str, int]] = {}
+    if measured_dp_ranks is None:
+        measured_devices = set(rank_steps)
+    else:
+        if topology is None:
+            raise ValueError(
+                "Scheduler topology is required when measured DP ranks are provided"
+            )
+        measured_dp_rank_set = set(measured_dp_ranks)
+        available_dp_ranks = {item.attn_dp_rank for item in topology.values()}
+        unknown_dp_ranks = measured_dp_rank_set - available_dp_ranks
+        if unknown_dp_ranks:
+            raise ValueError(
+                "Measured requests reference unavailable attention-DP ranks: "
+                f"{sorted(unknown_dp_ranks)}"
+            )
+        measured_devices = {
+            device
+            for device, item in topology.items()
+            if item.attn_dp_rank in measured_dp_rank_set
+        }
+        missing_devices = measured_devices - rank_steps.keys()
+        if missing_devices:
+            raise ValueError(
+                "Measured attention-DP groups lack scheduler steps for devices: "
+                f"{sorted(missing_devices)}"
+            )
+
+    audit: dict[int, dict[str, int | bool]] = {}
     eager_steps: list[tuple[int, int]] = []
     for device, steps in sorted(rank_steps.items()):
         active_prefill = [
@@ -684,14 +715,21 @@ def validate_prefill_cuda_graph_execution(
             for index, step in active_prefill
             if step.graph_kernel_count == 0
         ]
-        eager_steps.extend((device, index) for index, _ in eager)
+        serves_measured_requests = device in measured_devices
+        if serves_measured_requests:
+            eager_steps.extend((device, index) for index, _ in eager)
         audit[device] = {
             "active_prefill_steps": len(active_prefill),
             "graphed_prefill_steps": len(graphed),
             "eager_prefill_steps": len(eager),
+            "serves_measured_requests": serves_measured_requests,
         }
 
-    active_count = sum(item["active_prefill_steps"] for item in audit.values())
+    active_count = sum(
+        item["active_prefill_steps"]
+        for item in audit.values()
+        if item["serves_measured_requests"]
+    )
     if required and active_count == 0:
         raise ValueError(
             "Prefill CUDA graph execution was required, but the measured "
@@ -1144,8 +1182,9 @@ def main() -> None:
         "--require-prefill-cuda-graph",
         action="store_true",
         help=(
-            "Fail if any active measured prefill step contains no CUDA graph "
-            "nodes. Use when evaluating an explicitly configured prefill graph."
+            "Fail if an active prefill step on an attention-DP group serving a "
+            "measured request contains no CUDA graph nodes. Use when evaluating "
+            "an explicitly configured prefill graph."
         ),
     )
     args = parser.parse_args()
@@ -1214,7 +1253,10 @@ def main() -> None:
         ]
 
     prefill_cuda_graph_execution = validate_prefill_cuda_graph_execution(
-        rank_steps, required=args.require_prefill_cuda_graph
+        rank_steps,
+        required=args.require_prefill_cuda_graph,
+        topology=topology,
+        measured_dp_ranks=client_dp_ranks,
     )
 
     step_groups = build_step_groups(rank_steps)
