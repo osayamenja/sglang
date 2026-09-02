@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import math
 import sqlite3
 import statistics
 import sys
@@ -963,6 +962,19 @@ def request_window_components(
             "Kernel interval union exceeds model span in request window: "
             f"compute={compute}, coverage={kernel_coverage}, total={total}"
         )
+    communication = communication_active - communication_compute_overlap
+    uncovered = total - kernel_coverage
+    if communication < 0 or uncovered < 0:
+        raise AssertionError(
+            "Request-window kernel accounting produced a negative bucket"
+        )
+    if total != sum((compute, communication, uncovered)):
+        raise AssertionError(
+            "Request window violates total = compute + communication + uncovered "
+            "in integer nanoseconds: "
+            f"total={total}, compute={compute}, communication={communication}, "
+            f"uncovered={uncovered}"
+        )
     validate_communication_compute_overlap(
         max(
             (right - left for left, right in communication_compute_overlap_segments),
@@ -974,8 +986,8 @@ def request_window_components(
 
     ns_to_ms = 1e-6
     compute_ms = compute * ns_to_ms
-    communication_ms = (communication_active - communication_compute_overlap) * ns_to_ms
-    uncovered_ms = (total - kernel_coverage) * ns_to_ms
+    communication_ms = communication * ns_to_ms
+    uncovered_ms = uncovered * ns_to_ms
     result = {
         # Use the same summation operation as the serialized invariant check.
         # Python 3.12's compensated sum can differ by one final bit from a
@@ -988,15 +1000,6 @@ def request_window_components(
         "outside_model": (window - total) * ns_to_ms,
         "client_window": window * ns_to_ms,
     }
-    if not math.isclose(
-        result["total"],
-        result["compute"] + result["communication"] + result["uncovered"],
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise AssertionError(
-            "Request window violates total = compute + communication + uncovered"
-        )
     return result
 
 
