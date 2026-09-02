@@ -270,7 +270,7 @@ class TestRequestAttribution(unittest.TestCase):
         self.assertEqual(groups[0].phase, "prefill")
 
     def test_required_prefill_cuda_graph_rejects_eager_fallback(self):
-        with self.assertRaisesRegex(ValueError, "ran eagerly.*\\(0, 0\\)"):
+        with self.assertRaisesRegex(ValueError, "fully eagerly.*\\[0\\]"):
             trace.validate_prefill_cuda_graph_execution(
                 {0: [_rank_step(0, 0, 100, phase="prefill")]}, required=True
             )
@@ -278,48 +278,43 @@ class TestRequestAttribution(unittest.TestCase):
     def test_required_prefill_cuda_graph_accepts_graph_nodes(self):
         graphed = replace(_rank_step(0, 0, 100, phase="prefill"), graph_kernel_count=1)
 
-        audit = trace.validate_prefill_cuda_graph_execution(
+        device_audit, step_audit = trace.validate_prefill_cuda_graph_execution(
             {0: [graphed]}, required=True
         )
 
-        self.assertEqual(audit[0]["graphed_prefill_steps"], 1)
-        self.assertEqual(audit[0]["eager_prefill_steps"], 0)
+        self.assertEqual(device_audit[0]["graphed_prefill_steps"], 1)
+        self.assertEqual(device_audit[0]["eager_prefill_steps"], 0)
+        self.assertEqual(step_audit[0]["graphed_devices"], [0])
 
-    def test_prefill_graph_requirement_ignores_unselected_dp_groups(self):
-        eager_dp0 = _rank_step(0, 0, 100, phase="prefill")
-        graphed_dp1 = replace(
+    def test_prefill_graph_requirement_accepts_rank_asymmetric_replay(self):
+        eager_rank = _rank_step(0, 0, 100, phase="prefill")
+        graphed_rank = replace(
             _rank_step(1, 0, 100, phase="prefill"), graph_kernel_count=1
         )
-        topology = {
-            0: _topology(0, 10, 0),
-            1: _topology(1, 11, 1),
-        }
 
-        audit = trace.validate_prefill_cuda_graph_execution(
-            {0: [eager_dp0], 1: [graphed_dp1]},
+        device_audit, step_audit = trace.validate_prefill_cuda_graph_execution(
+            {0: [eager_rank], 1: [graphed_rank]},
             required=True,
-            topology=topology,
-            measured_dp_ranks=[1],
         )
 
-        self.assertFalse(audit[0]["serves_measured_requests"])
-        self.assertEqual(audit[0]["eager_prefill_steps"], 1)
-        self.assertTrue(audit[1]["serves_measured_requests"])
+        self.assertEqual(device_audit[0]["eager_prefill_steps"], 1)
+        self.assertEqual(step_audit[0]["graphed_devices"], [1])
+        self.assertEqual(step_audit[0]["eager_devices"], [0])
 
-    def test_prefill_graph_requirement_checks_every_rank_in_selected_dp_group(self):
-        graphed = replace(_rank_step(0, 0, 100, phase="prefill"), graph_kernel_count=1)
-        eager = _rank_step(1, 0, 100, phase="prefill")
-        topology = {
-            0: _topology(0, 10, 1, attn_tp_rank=0),
-            1: _topology(1, 11, 1, attn_tp_rank=1),
-        }
+    def test_prefill_graph_requirement_checks_every_global_prefill_step(self):
+        graphed_then_eager = [
+            replace(_rank_step(0, 0, 100), graph_kernel_count=1),
+            _rank_step(0, 100, 200),
+        ]
+        eager_steps = [
+            _rank_step(1, 0, 100),
+            _rank_step(1, 100, 200),
+        ]
 
-        with self.assertRaisesRegex(ValueError, "ran eagerly.*\\(1, 0\\)"):
+        with self.assertRaisesRegex(ValueError, "fully eagerly.*\\[1\\]"):
             trace.validate_prefill_cuda_graph_execution(
-                {0: [graphed], 1: [eager]},
+                {0: graphed_then_eager, 1: eager_steps},
                 required=True,
-                topology=topology,
-                measured_dp_ranks=[1],
             )
 
     def test_concurrent_requests_use_individual_dp_timelines(self):

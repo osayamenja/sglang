@@ -221,10 +221,11 @@ captured token sizes, pass them directly through the suite, for example:
 Use `--cuda-graph-backend-prefill disabled` to disable prefill graphs or
 `--cuda-graph-backend-prefill tc_piecewise` to select that backend. Any
 non-disabled backend enables measured-graph validation: analysis fails if an
-active prefill step in an attention-DP group that served a measured request has
-no CUDA graph nodes. Other DP groups can execute coordination-only prefill-mode
-steps eagerly; those steps remain visible in the per-device audit but are not
-treated as graph fallbacks.
+active global prefill scheduler step has no CUDA graph nodes on any device. The
+phase marker describes the distributed forward mode, so padded or coordination
+ranks can also be marked as prefill and may execute eagerly. Per-device and
+per-step audits retain that asymmetry, including the exact graphed and eager
+devices for every prefill step.
 `--no-require-prefill-cuda-graph` is available for deliberate fallback
 experiments.
 
