@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import sys
 import unittest
@@ -10,6 +11,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 BENCHMARK_DIR = (
     Path(__file__).resolve().parents[3] / "benchmark" / "purlin_latency_breakdown"
+)
+CUSTOM_ALL_REDUCE_HEADER = (
+    Path(__file__).resolve().parents[3]
+    / "python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh"
 )
 sys.path.insert(0, str(BENCHMARK_DIR))
 
@@ -401,6 +406,26 @@ class TestRequestAttribution(unittest.TestCase):
         self.assertTrue(
             trace.is_communication_kernel("all_reduce_one_shot_kernel", frozenset())
         )
+
+    def test_all_custom_all_reduce_collective_kernels_are_allowlisted(self):
+        source = CUSTOM_ALL_REDUCE_HEADER.read_text()
+        declared_kernels = frozenset(
+            re.findall(
+                r"ALL_REDUCE_KERNEL\s+void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                source,
+            )
+        )
+
+        self.assertEqual(
+            declared_kernels,
+            trace.CUSTOM_ALL_REDUCE_KERNEL_NAMES,
+            "Review every CUDA kernel added to custom_all_reduce.cuh before "
+            "updating the communication-kernel allowlist.",
+        )
+        for name in declared_kernels:
+            with self.subTest(name=name):
+                self.assertTrue(trace.is_communication_kernel(name, frozenset()))
+        self.assertFalse(trace.is_communication_kernel("memcpy_kernel", frozenset()))
 
 
 class TestSummaryWording(unittest.TestCase):

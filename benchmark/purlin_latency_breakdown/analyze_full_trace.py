@@ -42,16 +42,26 @@ from typing import Iterable
 
 MEASUREMENT_MARKER_PREFIX = "sglang.measurement:"
 BATCH_PHASE_MARKER_PREFIX = "sglang.batch_phase:"
-COMMUNICATION_KERNEL_NAMES = frozenset(
+CUSTOM_ALL_REDUCE_KERNEL_NAMES = frozenset(
     {
-        "all_reduce_one_shot_push_kernel",
-        "all_reduce_one_shot_kernel",
-        "all_reduce_two_shot_kernel",
-        "_all_gather_kernel_inner",
-        "allReduceKernel",
-        "allGatherKernel",
-        "reduceScatterKernel",
+        "all_reduce_1shot_push_kernel",
+        "all_reduce_1shot_pull_kernel",
+        "all_reduce_2shot_pull_kernel",
     }
+)
+COMMUNICATION_KERNEL_NAMES = (
+    frozenset(
+        {
+            "all_reduce_one_shot_push_kernel",
+            "all_reduce_one_shot_kernel",
+            "all_reduce_two_shot_kernel",
+            "_all_gather_kernel_inner",
+            "allReduceKernel",
+            "allGatherKernel",
+            "reduceScatterKernel",
+        }
+    )
+    | CUSTOM_ALL_REDUCE_KERNEL_NAMES
 )
 COLLECTIVE_NAME_WARNING_TERMS = (
     "nccl",

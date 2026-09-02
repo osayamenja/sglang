@@ -197,11 +197,13 @@ The attention-backend distinction is intentional:
   preserves SGLang's model/GPU-specific backend selection.
 
 Communication classification is deliberately explicit. Names beginning with
-`ncclDevKernel_`, the known SGLang custom-collective names, and the known Purlin
-collective names are communication; every other recognized kernel is compute.
-A future
-collective-looking but unrecognized name is a hard failure. If another backend
-needs an addition, pass its reviewed exact name with
+`ncclDevKernel_`, every CUDA kernel declared in
+`python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh` with the
+`ALL_REDUCE_KERNEL` marker, the other known SGLang custom-collective names, and
+the known Purlin collective names are communication; every other recognized
+kernel is compute. The generic `memcpy_kernel` staging helper remains compute.
+A future collective-looking but unrecognized name is a hard failure. If another
+backend needs an addition, pass its reviewed exact name with
 `--communication-pattern <kernel-name>` and verify the emitted diagnostics.
 
 Random prompts are sent as token IDs by default, so `--input-len` is the exact
