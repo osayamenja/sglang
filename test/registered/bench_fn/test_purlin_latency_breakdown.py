@@ -407,6 +407,29 @@ class TestRequestAttribution(unittest.TestCase):
         )
         trace.summarize_metric([values])
 
+    def test_large_request_window_checks_integer_invariant_before_conversion(self):
+        compute_ns = 6_230_121_090
+        communication_ns = 11_425_666_897
+        uncovered_ns = 7_702_272_603
+        total_ns = compute_ns + communication_ns + uncovered_ns
+        rank = _rank_step(
+            0,
+            0,
+            total_ns,
+            compute_intervals=((0, compute_ns),),
+            communication_intervals=((compute_ns, compute_ns + communication_ns),),
+        )
+
+        values = trace.request_window_components(
+            [trace.CriticalStep(0, "decode", rank, rank)], 0, total_ns
+        )
+
+        self.assertEqual(
+            values["total"],
+            sum(values[bucket] for bucket in ("compute", "communication", "uncovered")),
+        )
+        trace.summarize_metric([values])
+
     def test_request_window_does_not_sum_separate_tolerated_overlaps(self):
         first = _rank_step(
             0,
