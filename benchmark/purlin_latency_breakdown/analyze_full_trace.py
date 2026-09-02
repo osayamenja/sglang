@@ -157,18 +157,32 @@ def interval_union_length(intervals: Iterable[tuple[int, int]]) -> int:
 def interval_intersection_length(
     first: Iterable[tuple[int, int]], second: Iterable[tuple[int, int]]
 ) -> int:
-    first = sorted(first)
-    second = sorted(second)
-    first_index = second_index = total = 0
+    return sum(
+        right - left for left, right in interval_intersection_segments(first, second)
+    )
+
+
+def interval_intersection_segments(
+    first: Iterable[tuple[int, int]], second: Iterable[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Return disjoint intervals where both input interval unions are active."""
+
+    first = merge_intervals(first)
+    second = merge_intervals(second)
+    first_index = second_index = 0
+    intersections: list[tuple[int, int]] = []
     while first_index < len(first) and second_index < len(second):
         first_left, first_right = first[first_index]
         second_left, second_right = second[second_index]
-        total += max(0, min(first_right, second_right) - max(first_left, second_left))
+        left = max(first_left, second_left)
+        right = min(first_right, second_right)
+        if left < right:
+            intersections.append((left, right))
         if first_right < second_right:
             first_index += 1
         else:
             second_index += 1
-    return total
+    return tuple(intersections)
 
 
 def validate_communication_compute_overlap(
@@ -937,8 +951,11 @@ def request_window_components(
     kernel_coverage = interval_union_length(
         (*merged_compute_intervals, *merged_communication_intervals)
     )
-    communication_compute_overlap = interval_intersection_length(
+    communication_compute_overlap_segments = interval_intersection_segments(
         merged_communication_intervals, merged_compute_intervals
+    )
+    communication_compute_overlap = sum(
+        right - left for left, right in communication_compute_overlap_segments
     )
     window = window_end - window_start
     if compute > total or kernel_coverage > total:
@@ -947,9 +964,12 @@ def request_window_components(
             f"compute={compute}, coverage={kernel_coverage}, total={total}"
         )
     validate_communication_compute_overlap(
-        communication_compute_overlap,
+        max(
+            (right - left for left, right in communication_compute_overlap_segments),
+            default=0,
+        ),
         overlap_tolerance_ns,
-        f"{context} [{window_start}, {window_end}]",
+        f"contiguous overlap episode in {context} [{window_start}, {window_end}]",
     )
 
     ns_to_ms = 1e-6
@@ -964,6 +984,7 @@ def request_window_components(
         "compute": compute_ms,
         "communication": communication_ms,
         "uncovered": uncovered_ms,
+        "communication_compute_overlap": communication_compute_overlap * ns_to_ms,
         "outside_model": (window - total) * ns_to_ms,
         "client_window": window * ns_to_ms,
     }
@@ -1173,8 +1194,8 @@ def main() -> None:
         default=DEFAULT_COMMUNICATION_COMPUTE_OVERLAP_TOLERANCE_NS,
         help=(
             "Maximum compute/communication kernel overlap allowed per scheduler "
-            "step or request window. Failures report both the observed overlap "
-            "and this configured threshold."
+            "step or contiguous overlap episode in a request window. Failures "
+            "report both the observed overlap and this configured threshold."
         ),
     )
     parser.add_argument(

@@ -407,6 +407,34 @@ class TestRequestAttribution(unittest.TestCase):
         )
         trace.summarize_metric([values])
 
+    def test_request_window_does_not_sum_separate_tolerated_overlaps(self):
+        first = _rank_step(
+            0,
+            0,
+            100,
+            compute_intervals=((0, 60),),
+            communication_intervals=((50, 80),),
+        )
+        second = _rank_step(
+            0,
+            100,
+            200,
+            compute_intervals=((100, 160),),
+            communication_intervals=((150, 180),),
+        )
+
+        values = trace.request_window_components(
+            [
+                trace.CriticalStep(0, "decode", first, first),
+                trace.CriticalStep(1, "decode", second, second),
+            ],
+            0,
+            200,
+            overlap_tolerance_ns=10,
+        )
+
+        self.assertAlmostEqual(values["communication_compute_overlap"], 20e-6)
+
     def test_unexpected_overlap_fails(self):
         rank = _rank_step(
             0,

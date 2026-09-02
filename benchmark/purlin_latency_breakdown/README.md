@@ -77,8 +77,11 @@ as communication.
 Communication is therefore kernel-active collective time, including time a
 collective kernel itself spends waiting, but it no longer absorbs uncovered
 launch or synchronization gaps. By default, compute/communication overlap
-above 25 microseconds in any step or request window is a hard validation
-failure; smaller timestamp-scale slivers are tolerated. Use
+above 25 microseconds in any step or contiguous request-window overlap episode
+is a hard validation failure; smaller timestamp-scale slivers are tolerated.
+Request windows can span thousands of scheduler steps, so their separately
+tolerated overlap episodes are reported cumulatively but are not incorrectly
+compared as one event against the per-episode threshold. Use
 `--overlap-tolerance-ns` to supply a hardware-calibrated limit. A failure
 reports the observed overlap, configured threshold, excess, and the offending
 device step or request window in both nanoseconds and microseconds.
