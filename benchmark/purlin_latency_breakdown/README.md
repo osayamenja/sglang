@@ -184,10 +184,14 @@ The following translates the B300 server configuration for
   --output-dir benchmark_results/b300_deepseek_v4_pro_nvfp4
 ```
 
-`--enable-dp-attention` and `--trust-remote-code` are enabled by default, so
-they need not be repeated. The runner also defaults to host `0.0.0.0`, port
-`30000`, breakable prefill CUDA graphs, CUDA-graph max decode batch size `256`,
-and watchdog timeout `3600`.
+`--enable-dp-attention`, `--enable-prefill-delayer`, and
+`--trust-remote-code` are enabled by default, so they need not be repeated.
+The prefill delayer helps attention-DP ranks admit prefills together, which is
+required for clean per-request TTFT breakdowns. Use
+`--no-enable-prefill-delayer` only for a deliberate comparison against the
+ordinary scheduler. The runner also defaults to host `0.0.0.0`, port `30000`,
+breakable prefill CUDA graphs, CUDA-graph max decode batch size `256`, and
+watchdog timeout `3600`.
 
 The attention-backend distinction is intentional:
 

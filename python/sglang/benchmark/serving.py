@@ -68,6 +68,14 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 global args
 
 
+def _measurement_protocol_requested() -> bool:
+    """Return whether the caller opted into the trace-suite measurement path."""
+    return (
+        getattr(args, "measurement_run_id", None) is not None
+        or getattr(args, "measurement_dp_size", 0) > 0
+    )
+
+
 # don't want to import sglang package here
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
@@ -313,15 +321,13 @@ def _extract_cache_from_sglext(data, output):
     """Extract cache hit details from sglext in OAI-compatible responses."""
     sglext = data.get("sglext") or {}
     details = sglext.get("cached_tokens_details")
-    if details is not None:
-        cached_tokens = (
+    if details:
+        output.cached_tokens = (
             (details.get("device") or 0)
             + (details.get("host") or 0)
             + (details.get("storage") or 0)
         )
-        output.cached_tokens = max(output.cached_tokens, cached_tokens)
         output.cached_tokens_details = details
-        output.cache_metadata_seen = True
 
 
 def _extract_sglang_meta_info(data: Dict[str, Any], output: RequestFuncOutput) -> None:
@@ -347,6 +353,18 @@ def _extract_sglang_meta_info(data: Dict[str, Any], output: RequestFuncOutput) -
             f"{output.dp_rank} -> {dp_rank}"
         )
     output.dp_rank = dp_rank
+
+
+def _record_sglang_response_metadata(
+    data: Dict[str, Any], output: RequestFuncOutput
+) -> None:
+    """Use strict trace metadata only for the measurement protocol."""
+    if _measurement_protocol_requested():
+        _extract_sglang_meta_info(data, output)
+    elif getattr(args, "cache_report", False):
+        meta_info = data.get("meta_info") or {}
+        output.cached_tokens = meta_info.get("cached_tokens", 0)
+        output.cached_tokens_details = meta_info.get("cached_tokens_details")
 
 
 # set ignore_eos True by default
@@ -422,7 +440,8 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            _extract_cache_from_sglext(data, output)
+                            if getattr(args, "cache_report", False):
+                                _extract_cache_from_sglext(data, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -590,7 +609,8 @@ async def async_request_openai_chat_completions(
                         output.spec_cap_lens_histogram = (
                             _meta_info.get("spec_cap_lens_histogram", []) or []
                         )
-                        _extract_cache_from_sglext(response_json, output)
+                        if getattr(args, "cache_report", False):
+                            _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -610,7 +630,8 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                                _extract_cache_from_sglext(data, output)
+                                if getattr(args, "cache_report", False):
+                                    _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
                                 if not choices:
@@ -789,12 +810,14 @@ async def async_request_sglang_generate(
         generated_text = ""
         output_len = request_func_input.output_len
         ttft = 0.0
+        measurement_protocol = _measurement_protocol_requested()
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
         try:
-            output.send_time = time.perf_counter()
+            if measurement_protocol:
+                output.send_time = time.perf_counter()
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
@@ -823,7 +846,10 @@ async def async_request_sglang_generate(
                                     "spec_accept_length"
                                 ]
 
-                            _extract_sglang_meta_info(data, output)
+                            if measurement_protocol or getattr(
+                                args, "cache_report", False
+                            ):
+                                _record_sglang_response_metadata(data, output)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -851,7 +877,8 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                    output.finish_time = time.perf_counter()
+                    if measurement_protocol:
+                        output.finish_time = time.perf_counter()
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -968,9 +995,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(
-                url=api_url, json=body, headers=get_auth_headers()
-            ) as response:
+            request_kwargs: Dict[str, Any] = {"url": api_url, "json": body}
+            if _measurement_protocol_requested():
+                request_kwargs["headers"] = get_auth_headers()
+            async with session.post(**request_kwargs) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1060,7 +1088,7 @@ async def _call_profile_pd(profile_urls: List[Tuple[str, str]], mode: str) -> No
         if profile_output.success:
             print(f"Profiler {action_past} for {worker_type} worker at {url}")
         else:
-            raise RuntimeError(
+            print(
                 f"Failed to {mode} profiler for {worker_type} worker at {url}: "
                 f"{profile_output.error}"
             )
@@ -1719,28 +1747,47 @@ async def benchmark(
         extra_request_body=extra_request_body,
     )
 
-    await run_warmup_requests(
-        limited_request_func,
-        test_input,
-        warmup_requests,
-        is_multi_turn=is_multi_turn,
-    )
-    print(
-        f"Warmup completed with {warmup_requests} sequences. "
-        "Preparing main benchmark run..."
-    )
+    if measurement_protocol:
+        await run_warmup_requests(
+            limited_request_func,
+            test_input,
+            warmup_requests,
+            is_multi_turn=is_multi_turn,
+        )
+        print(
+            f"Warmup completed with {warmup_requests} sequences. "
+            "Preparing main benchmark run..."
+        )
+    else:
+        warmup_tasks = [
+            asyncio.create_task(request_func(request_func_input=test_input))
+            for _ in range(warmup_requests)
+        ]
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
+        if is_multi_turn:
+            warmup_outputs = [x for output in warmup_outputs for x in output]
+
+        if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
+            raise ValueError(
+                "Warmup failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {warmup_outputs[0].error}"
+            )
+        print(
+            f"Warmup completed with {warmup_requests} sequences. "
+            "Starting main benchmark run..."
+        )
 
     # Flush cache after warmup so the measured run does not benefit from
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
-    should_flush = (
+    should_flush_cache = (
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
-    if should_flush:
-        if backend.startswith("sglang"):
+    if should_flush_cache:
+        if measurement_protocol:
             flush_cache_or_raise(
                 base_url,
-                empty_cache=not measurement_protocol,
+                empty_cache=False,
                 overall_timeout_s=flush_cache_timeout,
                 server_timeout_s=min(
                     _FLUSH_CACHE_SERVER_TIMEOUT_SECONDS, flush_cache_timeout
@@ -1748,27 +1795,39 @@ async def benchmark(
             )
         else:
             flush_server_cache(base_url, backend, flush_cache_timeout)
+    if not measurement_protocol:
+        time.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
     if profile and pd_separated:
         pd_profile_urls = _build_profile_urls(profile_prefill_url, profile_decode_url)
         if not pd_profile_urls:
-            raise ValueError(
-                "PD separated mode requires --profile-prefill-url or "
+            print(
+                "Warning: PD separated mode requires --profile-prefill-url or "
                 "--profile-decode-url"
             )
+            print("Skipping profiler start. Please specify worker URLs for profiling.")
 
     # Start profiler
     profile_started = False
     if profile:
         if pd_separated:
-            await _call_profile_pd(pd_profile_urls, "start")
+            if pd_profile_urls:
+                await _call_profile_pd(pd_profile_urls, "start")
+                profile_started = True
         else:
             print("Starting profiler...")
-            await profile_request_or_raise(base_url + "/start_profile", "start")
-            print("Profiler started")
-        profile_started = True
+            if measurement_protocol:
+                await profile_request_or_raise(base_url + "/start_profile", "start")
+                print("Profiler started")
+                profile_started = True
+            else:
+                profile_output = await async_request_profile(
+                    api_url=base_url + "/start_profile"
+                )
+                if profile_output.success:
+                    print("Profiler started")
 
     pbar = None
     try:
@@ -1784,6 +1843,10 @@ async def benchmark(
                 dp_size=measurement_dp_size,
             )
             flush_cache_or_raise(base_url, empty_cache=False)
+        else:
+            # Preserve the ordinary serving benchmark's historical duration
+            # boundary, which includes request-generator setup and cleanup.
+            benchmark_start_time = time.perf_counter()
 
         pbar_total = len(input_requests)
         if (
@@ -1874,11 +1937,14 @@ async def benchmark(
                 return await asyncio.gather(*tasks)
 
             measurement_started = True
-            (
-                raw_outputs,
-                benchmark_start_time,
-                benchmark_end_time,
-            ) = await run_timed_measurement(schedule_and_gather_requests)
+            if measurement_protocol:
+                (
+                    raw_outputs,
+                    benchmark_start_time,
+                    benchmark_end_time,
+                ) = await run_timed_measurement(schedule_and_gather_requests)
+            else:
+                raw_outputs = await schedule_and_gather_requests()
         finally:
             if measurement_protocol and measurement_started:
                 try:
@@ -1900,20 +1966,32 @@ async def benchmark(
                 require_dp_rank=require_dp_rank,
             )
     finally:
-        if pbar is not None:
-            pbar.close()
-        should_stop_profile = (
-            profile_started
-            and getattr(args, "profile_steps", None) is None
-            and getattr(args, "profile_num_steps", None) is None
-        )
-        if should_stop_profile:
-            if pd_separated:
-                await _call_profile_pd(pd_profile_urls, "stop")
-            else:
+        if measurement_protocol:
+            if pbar is not None:
+                pbar.close()
+            should_stop_profile = (
+                profile_started
+                and getattr(args, "profile_steps", None) is None
+                and getattr(args, "profile_num_steps", None) is None
+            )
+            if should_stop_profile:
                 print("Stopping profiler...")
                 await profile_request_or_raise(base_url + "/stop_profile", "stop")
                 print("Profiler stopped")
+        else:
+            if profile and getattr(args, "profile_steps", None) is None:
+                if pd_separated:
+                    if pd_profile_urls:
+                        await _call_profile_pd(pd_profile_urls, "stop")
+                elif getattr(args, "profile_num_steps", None) is None:
+                    print("Stopping profiler...")
+                    profile_output = await async_request_profile(
+                        api_url=base_url + "/stop_profile"
+                    )
+                    if profile_output.success:
+                        print("Profiler stopped")
+            if pbar is not None:
+                pbar.close()
 
     if "sglang" in backend:
         server_info = requests.get(
@@ -1938,7 +2016,10 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = benchmark_end_time - benchmark_start_time
+    if measurement_protocol:
+        benchmark_duration = benchmark_end_time - benchmark_start_time
+    else:
+        benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -2132,7 +2213,6 @@ async def benchmark(
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            "run_id": measurement_run_id,
             # Information
             "server_info": server_info,
             # Results
@@ -2177,6 +2257,9 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        if measurement_protocol:
+            result["run_id"] = measurement_run_id
+
         if args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
@@ -2214,12 +2297,17 @@ async def benchmark(
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "send_times": [output.send_time for output in outputs],
-        "finish_times": [output.finish_time for output in outputs],
-        "dp_ranks": [output.dp_rank for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if measurement_protocol:
+        result_details.update(
+            {
+                "send_times": [output.send_time for output in outputs],
+                "finish_times": [output.finish_time for output in outputs],
+                "dp_ranks": [output.dp_rank for output in outputs],
+            }
+        )
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]

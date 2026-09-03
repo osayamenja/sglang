@@ -41,9 +41,46 @@ class TestRunSuiteDefaults(unittest.TestCase):
 
         self.assertEqual(args.cuda_graph_backend_prefill, "breakable")
         self.assertTrue(args.require_prefill_cuda_graph)
+        self.assertTrue(args.enable_prefill_delayer)
         command = suite.common_server_command(args, "baseline")
         option_index = command.index("--cuda-graph-backend-prefill")
         self.assertEqual(command[option_index + 1], "breakable")
+        self.assertIn("--enable-prefill-delayer", command)
+
+        client = suite.client_command(
+            args,
+            Path("results.jsonl"),
+            num_prompts=4,
+            profile=False,
+            run_id="baseline-clean-test",
+        )
+        self.assertEqual(
+            client[client.index("--measurement-run-id") + 1],
+            "baseline-clean-test",
+        )
+        self.assertEqual(
+            client[client.index("--measurement-dp-size") + 1], str(args.dp)
+        )
+
+    def test_prefill_delayer_can_be_disabled_explicitly(self):
+        argv = [
+            "run_suite.py",
+            "--model",
+            "test-model",
+            "--tp",
+            "2",
+            "--output-dir",
+            "test-output",
+            "--no-enable-prefill-delayer",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = suite.parse_args()
+
+        self.assertFalse(args.enable_prefill_delayer)
+        self.assertNotIn(
+            "--enable-prefill-delayer",
+            suite.common_server_command(args, "baseline"),
+        )
 
 
 def _rank_step(
