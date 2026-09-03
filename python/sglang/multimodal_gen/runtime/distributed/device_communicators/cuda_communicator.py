@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.purlin_utils
     initialize_purlin_handle,
     is_purlin_supported_device,
 )
+from sglang.srt.distributed.device_communicators.torchcomms_adapter import (
+    TorchCommsCommunicator,
+)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -36,10 +39,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
         enable_purlin: bool = False,
+        enable_torchcomms: bool = False,
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
         self.enable_purlin = enable_purlin
+        self.enable_torchcomms = enable_torchcomms
         self.purlin_handle = None
+        self.torchcomms_comm: TorchCommsCommunicator | None = None
 
         from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
@@ -55,6 +61,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.purlin_handle = initialize_purlin_handle(
                     group=self.device_group,
                     device=self.device,
+                )
+            if self.enable_torchcomms:
+                self.torchcomms_comm = TorchCommsCommunicator(
+                    ranks=torch.distributed.get_process_group_ranks(self.device_group),
+                    device=self.device,
+                    name=self.unique_name,
                 )
 
     def all_reduce(self, input_, op: torch.distributed.ReduceOp | None = None):
@@ -77,6 +89,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         async_op: bool = False,
         stream: torch.cuda.Stream | None = None,
     ):
+        if (
+            self.torchcomms_comm is not None
+            and self.torchcomms_comm.can_use(input_, output)
+            and input_.shape[0] == output.shape[0]
+            and input_.shape[0] % self.world_size == 0
+        ):
+            return self.torchcomms_comm.all_to_all(
+                output,
+                input_,
+                stream=stream,
+                async_op=async_op,
+            )
         if (
             can_use_purlin(self.purlin_handle, input_, output)
             and input_.nbytes == output.nbytes
@@ -102,6 +126,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
         async_op: bool = False,
         stream: torch.cuda.Stream | None = None,
     ):
+        if (
+            self.torchcomms_comm is not None
+            and self.torchcomms_comm.can_use(input_, output)
+            and len(input_split_sizes) == self.world_size
+            and len(output_split_sizes) == self.world_size
+            and input_.shape[0] == sum(input_split_sizes)
+            and output.shape[0] == sum(output_split_sizes)
+        ):
+            return self.torchcomms_comm.all_to_all(
+                output,
+                input_,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                stream=stream,
+                async_op=async_op,
+            )
         input_split_bytes = element_counts_to_bytes(input_split_sizes, input_)
         output_split_bytes = element_counts_to_bytes(output_split_sizes, input_)
         if (
@@ -133,7 +173,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def all_to_all_4D(
         self, input_: torch.Tensor, scatter_dim: int = 2, gather_dim: int = 1
     ) -> torch.Tensor:
-        if self.purlin_handle is None:
+        if self.purlin_handle is None and self.torchcomms_comm is None:
             return super().all_to_all_4D(input_, scatter_dim, gather_dim)
         return DistributedAutograd.AllToAll4D.apply(
             self.device_group,
@@ -173,6 +213,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return tensor
 
     def destroy(self) -> None:
+        if self.torchcomms_comm is not None:
+            self.torchcomms_comm.finalize()
+            self.torchcomms_comm = None
         if self.purlin_handle is not None:
             finalize_purlin_handle(self.purlin_handle, self.device)
             self.purlin_handle = None

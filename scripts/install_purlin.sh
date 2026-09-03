@@ -12,9 +12,14 @@ readonly SGL_KERNEL_VERSION="0.4.6.post1"
 readonly TORCH_VERSION="2.13.0"
 readonly TORCHAUDIO_VERSION="2.11.0"
 readonly TORCHVISION_VERSION="0.28.0"
+readonly MSCCLPP_VERSION="0.10.0"
+readonly MSCCLPP_GIT_TAG="v${MSCCLPP_VERSION}"
+readonly TORCHCOMMS_GIT_REPOSITORY="https://github.com/meta-pytorch/torchcomms.git"
+readonly TORCHCOMMS_GIT_REVISION="6288fc4d658f2b165623eb649c82149e82d2056b"
 readonly PYTHON_VERSION="3.12"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
+readonly TORCHCOMMS_NCCLX_PATCH="${SCRIPT_DIR}/patches/torchcomms-ncclx-response-file.patch"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly REPO_ROOT
 readonly VENV_DIR="${REPO_ROOT}/.venv"
@@ -22,6 +27,12 @@ readonly VENV_DIR="${REPO_ROOT}/.venv"
 CURRENT_STEP="startup"
 CUDA_OVERRIDE=""
 SKIP_SYSTEM_DEPS=0
+TORCHCOMMS_CUDA_ARCH_LIST=""
+TORCHCOMMS_CMAKE_CUDA_ARCHS=""
+TORCHCOMMS_NCCLX_GENCODE=""
+TORCHCOMMS_CUDA_IMAGE_LABEL=""
+TORCHCOMMS_SOURCE_DIR=""
+TORCHCOMMS_CUDA_IMAGES=()
 
 log() {
     printf '\n==> %s\n' "$*"
@@ -42,7 +53,8 @@ trap on_error ERR
 
 usage() {
     cat <<'EOF'
-Install this SGLang fork and Purlin into the repository's .venv.
+Install this SGLang fork and its communication backends into the repository's
+.venv.
 
 Usage:
   bash scripts/install_purlin.sh [options]
@@ -104,8 +116,24 @@ install_system_dependencies() {
     fi
     command -v cmake >/dev/null 2>&1 || missing+=(cmake)
     command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v git >/dev/null 2>&1 || missing+=(git)
     command -v ninja >/dev/null 2>&1 || missing+=(ninja-build)
     command -v protoc >/dev/null 2>&1 || missing+=(protobuf-compiler)
+    if ! dpkg-query -W -f='${Status}' libnuma-dev 2>/dev/null | \
+        grep -q '^install ok installed$'; then
+        missing+=(libnuma-dev)
+    fi
+
+    local package
+    for package in \
+        autoconf automake binutils bison flex git libibverbs-dev libnl-3-dev \
+        libnl-route-3-dev libnuma-dev libtool libunwind-dev make patch perl \
+        pkg-config; do
+        if ! dpkg-query -W -f='${Status}' "${package}" 2>/dev/null | \
+            grep -q '^install ok installed$'; then
+            missing+=("${package}")
+        fi
+    done
 
     if ((${#missing[@]} == 0)); then
         echo "Ubuntu build dependencies are already installed."
@@ -132,7 +160,8 @@ else
     install_system_dependencies
 fi
 
-for command in cmake curl ninja protoc; do
+for command in autoconf automake bison cmake curl flex git libtoolize make \
+    ninja patch perl pkg-config protoc readelf; do
     command -v "${command}" >/dev/null 2>&1 || \
         die "${command} is required; install the system dependencies or omit --skip-system-deps"
 done
@@ -160,6 +189,69 @@ if [[ -n "${CUDA_OVERRIDE}" && "${CUDA_OVERRIDE}" != "${CUDA_MAJOR}" ]]; then
     die "--cuda ${CUDA_OVERRIDE} does not match nvcc (${CUDA_RELEASE}); select the intended nvcc through PATH"
 fi
 echo "Detected CUDA ${CUDA_RELEASE} from $(command -v nvcc)."
+
+detect_torchcomms_architectures() {
+    local architecture_suffix
+    local cache_key
+    local capability
+    local compute_code
+    local image_csv
+    local query_output
+    local -A seen_capabilities=()
+    local -a cache_architectures=()
+    local -a cmake_architectures=()
+    local -a gencode_flags=()
+    local -a torch_architectures=()
+
+    command -v nvidia-smi >/dev/null 2>&1 || \
+        die "nvidia-smi is required to detect the TorchComms build architecture"
+    query_output="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader)" || \
+        die "nvidia-smi could not query GPU compute capabilities"
+
+    while IFS= read -r capability; do
+        capability="${capability//[[:space:]]/}"
+        [[ -n "${capability}" ]] || continue
+        [[ "${capability}" =~ ^([0-9]+)\.([0-9]+)$ ]] || \
+            die "nvidia-smi returned an invalid compute capability: ${capability}"
+        [[ -z "${seen_capabilities[${capability}]:-}" ]] || continue
+        seen_capabilities["${capability}"]=1
+
+        compute_code="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+        architecture_suffix=""
+        case "${capability}" in
+            10.0 | 10.3) architecture_suffix="a" ;;
+        esac
+
+        torch_architectures+=("${capability}${architecture_suffix}")
+        cmake_architectures+=("${compute_code}${architecture_suffix}")
+        TORCHCOMMS_CUDA_IMAGES+=("sm_${compute_code}${architecture_suffix}")
+        cache_architectures+=("sm${compute_code}${architecture_suffix}")
+        gencode_flags+=(
+            "-gencode=arch=compute_${compute_code}${architecture_suffix},code=sm_${compute_code}${architecture_suffix}"
+        )
+    done <<<"${query_output}"
+
+    ((${#TORCHCOMMS_CUDA_IMAGES[@]} > 0)) || \
+        die "no NVIDIA GPUs were found for the TorchComms build"
+    TORCHCOMMS_CUDA_ARCH_LIST="$(IFS=';'; printf '%s' "${torch_architectures[*]}")"
+    TORCHCOMMS_CMAKE_CUDA_ARCHS="$(IFS=';'; printf '%s' "${cmake_architectures[*]}")"
+    TORCHCOMMS_NCCLX_GENCODE="${gencode_flags[*]}"
+    image_csv="$(IFS=,; printf '%s' "${TORCHCOMMS_CUDA_IMAGES[*]}")"
+    TORCHCOMMS_CUDA_IMAGE_LABEL="${image_csv//,/, }"
+    cache_key="$(IFS=-; printf '%s' "${cache_architectures[*]}")"
+    TORCHCOMMS_SOURCE_DIR="${REPO_ROOT}/.cache/torchcomms-${TORCHCOMMS_GIT_REVISION}-${cache_key}"
+}
+
+CURRENT_STEP="GPU architecture detection"
+log "Detecting TorchComms build architectures"
+detect_torchcomms_architectures
+readonly TORCHCOMMS_CUDA_ARCH_LIST
+readonly TORCHCOMMS_CMAKE_CUDA_ARCHS
+readonly TORCHCOMMS_NCCLX_GENCODE
+readonly TORCHCOMMS_CUDA_IMAGE_LABEL
+readonly TORCHCOMMS_SOURCE_DIR
+readonly -a TORCHCOMMS_CUDA_IMAGES
+echo "Detected TorchComms CUDA images: ${TORCHCOMMS_CUDA_IMAGE_LABEL}"
 
 CURRENT_STEP="Rust toolchain"
 log "Checking the Rust toolchain"
@@ -204,6 +296,11 @@ UV_PIP=("${UV_BIN}" pip install --python "${PYTHON_BIN}")
 CURRENT_STEP="Purlin installation"
 log "Installing Purlin ${PURLIN_VERSION}"
 "${UV_PIP[@]}" "purlin==${PURLIN_VERSION}"
+
+CURRENT_STEP="SGLang build dependencies"
+log "Installing SGLang build dependencies"
+"${UV_PIP[@]}" \
+    "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" wheel
 
 install_cuda12_dependencies() {
     local machine_arch
@@ -267,7 +364,9 @@ PY
             "${cuda13_packages[@]}"
     fi
 
-    "${UV_PIP[@]}" --no-deps --editable "${REPO_ROOT}/python[diffusion]"
+    CARGO_TARGET_DIR="${VENV_DIR}/.cache/sglang-rust-target" \
+        "${UV_PIP[@]}" --no-build-isolation --no-deps --editable \
+        "${REPO_ROOT}/python[diffusion]"
 }
 
 CURRENT_STEP="SGLang CUDA ${CUDA_MAJOR} installation"
@@ -275,7 +374,9 @@ log "Installing this SGLang checkout for CUDA ${CUDA_MAJOR}"
 if [[ "${CUDA_MAJOR}" == "12" ]]; then
     install_cuda12_dependencies
 else
-    "${UV_PIP[@]}" --editable "${REPO_ROOT}/python[diffusion]"
+    CARGO_TARGET_DIR="${VENV_DIR}/.cache/sglang-rust-target" \
+        "${UV_PIP[@]}" --no-build-isolation --editable \
+        "${REPO_ROOT}/python[diffusion]"
 fi
 
 CURRENT_STEP="Hugging Face datasets compatibility"
@@ -287,11 +388,108 @@ log "Installing datasets ${DATASETS_VERSION} with compatible fsspec ${FSSPEC_VER
     "datasets==${DATASETS_VERSION}" \
     "fsspec==${FSSPEC_VERSION}"
 
+prepare_torchcomms_source() {
+    local actual_revision
+
+    mkdir -p "$(dirname "${TORCHCOMMS_SOURCE_DIR}")"
+    if [[ -d "${TORCHCOMMS_SOURCE_DIR}/.git" ]]; then
+        actual_revision="$(git -C "${TORCHCOMMS_SOURCE_DIR}" rev-parse HEAD)"
+        [[ "${actual_revision}" == "${TORCHCOMMS_GIT_REVISION}" ]] || \
+            die "${TORCHCOMMS_SOURCE_DIR} is at ${actual_revision}, expected ${TORCHCOMMS_GIT_REVISION}"
+        return
+    fi
+    [[ ! -e "${TORCHCOMMS_SOURCE_DIR}" ]] || \
+        die "${TORCHCOMMS_SOURCE_DIR} exists but is not a TorchComms git checkout"
+
+    git init "${TORCHCOMMS_SOURCE_DIR}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" remote add origin \
+        "${TORCHCOMMS_GIT_REPOSITORY}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" fetch --depth 1 origin \
+        "${TORCHCOMMS_GIT_REVISION}"
+    git -C "${TORCHCOMMS_SOURCE_DIR}" checkout --detach FETCH_HEAD
+}
+
+apply_torchcomms_patches() {
+    [[ -f "${TORCHCOMMS_NCCLX_PATCH}" ]] || \
+        die "TorchComms NCCLX patch is missing: ${TORCHCOMMS_NCCLX_PATCH}"
+
+    if git -C "${TORCHCOMMS_SOURCE_DIR}" apply --check \
+        "${TORCHCOMMS_NCCLX_PATCH}" 2>/dev/null; then
+        git -C "${TORCHCOMMS_SOURCE_DIR}" apply "${TORCHCOMMS_NCCLX_PATCH}"
+        echo "Applied the NCCLX response-file patch."
+    elif git -C "${TORCHCOMMS_SOURCE_DIR}" apply --reverse --check \
+        "${TORCHCOMMS_NCCLX_PATCH}" 2>/dev/null; then
+        echo "The NCCLX response-file patch is already applied."
+    else
+        die "the NCCLX response-file patch does not apply to ${TORCHCOMMS_GIT_REVISION}"
+    fi
+}
+
+CURRENT_STEP="TorchComms source checkout"
+log "Preparing TorchComms ${TORCHCOMMS_GIT_REVISION}"
+prepare_torchcomms_source
+apply_torchcomms_patches
+
+CURRENT_STEP="TorchComms NCCLX source build"
+log "Building TorchComms/NCCLX for ${TORCHCOMMS_CUDA_IMAGE_LABEL}"
+"${UV_PIP[@]}" packaging pyyaml setuptools wheel
+CUDA_HOME="$(cd "$(dirname "$(readlink -f "$(command -v nvcc)")")/.." && pwd)"
+readonly CUDA_HOME
+TORCHCOMMS_THIRD_PARTY_DIR="/tmp/third-party"
+TORCHCOMMS_THIRD_PARTY_WAS_PRESENT=0
+if [[ -e "${TORCHCOMMS_THIRD_PARTY_DIR}" ]]; then
+    TORCHCOMMS_THIRD_PARTY_WAS_PRESENT=1
+fi
+cleanup_torchcomms_third_party() {
+    if ((TORCHCOMMS_THIRD_PARTY_WAS_PRESENT == 0)) && \
+        [[ -d "${TORCHCOMMS_THIRD_PARTY_DIR}" ]]; then
+        find "${TORCHCOMMS_THIRD_PARTY_DIR}" -depth -delete
+    fi
+}
+trap cleanup_torchcomms_third_party EXIT
+(
+    export CMAKE_BUILD_PARALLEL_LEVEL="${TORCHCOMMS_BUILD_JOBS:-$(nproc)}"
+    export CMAKE_BUILD_TYPE=Release
+    export CUDA_HOME
+    export CUDAARCHS="${TORCHCOMMS_CMAKE_CUDA_ARCHS}"
+    export NCCL_BUILD_JOBS="${TORCHCOMMS_BUILD_JOBS:-$(nproc)}"
+    export NCCL_SKIP_CONDA_INSTALL=1
+    export NVCC_GENCODE="${TORCHCOMMS_NCCLX_GENCODE}"
+    export TORCH_CUDA_ARCH_LIST="${TORCHCOMMS_CUDA_ARCH_LIST}"
+    export USE_GLOO=OFF
+    export USE_NCCL=OFF
+    export USE_NCCLX=ON
+    export USE_TRANSPORT=OFF
+    export USE_TRANSPORT_CCA_HOOK=OFF
+    export USE_TRITON=OFF
+    "${UV_PIP[@]}" --reinstall --no-build-isolation --no-deps \
+        "${TORCHCOMMS_SOURCE_DIR}"
+)
+cleanup_torchcomms_third_party
+trap - EXIT
+
+CURRENT_STEP="MSCCL++ installation"
+log "Installing MSCCL++ ${MSCCLPP_VERSION}"
+MSCCLPP_SOURCE_DIR="$(mktemp -d -t sglang-mscclpp.XXXXXX)"
+cleanup_mscclpp_source() {
+    if [[ -n "${MSCCLPP_SOURCE_DIR:-}" && -d "${MSCCLPP_SOURCE_DIR}" ]]; then
+        rm -rf -- "${MSCCLPP_SOURCE_DIR}"
+    fi
+}
+trap cleanup_mscclpp_source EXIT
+git clone --depth 1 --branch "${MSCCLPP_GIT_TAG}" \
+    https://github.com/microsoft/mscclpp.git "${MSCCLPP_SOURCE_DIR}"
+"${UV_PIP[@]}" -Ccmake.define.MSCCLPP_USE_IB=OFF \
+    "${MSCCLPP_SOURCE_DIR}[cuda${CUDA_MAJOR}]"
+cleanup_mscclpp_source
+trap - EXIT
+
 CURRENT_STEP="installation verification"
 log "Verifying the installation"
 EXPECTED_ACCELERATE_VERSION="${ACCELERATE_VERSION}" \
 EXPECTED_CUDA_MAJOR="${CUDA_MAJOR}" EXPECTED_DATASETS_VERSION="${DATASETS_VERSION}" \
 EXPECTED_FSSPEC_VERSION="${FSSPEC_VERSION}" EXPECTED_PURLIN_VERSION="${PURLIN_VERSION}" \
+EXPECTED_MSCCLPP_VERSION="${MSCCLPP_VERSION}" \
     "${PYTHON_BIN}" <<'PY'
 import importlib.metadata
 import os
@@ -299,10 +497,12 @@ import os
 import accelerate
 import datasets
 import fsspec
+import mscclpp
 import purlin
 import pyarrow
 import sglang
 import torch
+import torchcomms
 from datasets import Dataset
 from diffusers.image_processor import VaeImageProcessor
 from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
@@ -311,16 +511,22 @@ expected_accelerate = os.environ["EXPECTED_ACCELERATE_VERSION"]
 expected_cuda = os.environ["EXPECTED_CUDA_MAJOR"]
 expected_datasets = os.environ["EXPECTED_DATASETS_VERSION"]
 expected_fsspec = os.environ["EXPECTED_FSSPEC_VERSION"]
+expected_mscclpp = os.environ["EXPECTED_MSCCLPP_VERSION"]
 expected_purlin = os.environ["EXPECTED_PURLIN_VERSION"]
 accelerate_version = importlib.metadata.version("accelerate")
 datasets_version = importlib.metadata.version("datasets")
 fsspec_version = importlib.metadata.version("fsspec")
+mscclpp_version = importlib.metadata.version("mscclpp")
 purlin_version = importlib.metadata.version("purlin")
 torch_cuda = torch.version.cuda
 
 if accelerate_version != expected_accelerate:
     raise SystemExit(
         f"Expected accelerate {expected_accelerate}, but found {accelerate_version}."
+    )
+if mscclpp_version != expected_mscclpp:
+    raise SystemExit(
+        f"Expected mscclpp {expected_mscclpp}, but found {mscclpp_version}."
     )
 if purlin_version != expected_purlin:
     raise SystemExit(
@@ -338,6 +544,8 @@ if not torch_cuda or torch_cuda.split(".", 1)[0] != expected_cuda:
     raise SystemExit(
         f"Expected a CUDA {expected_cuda} PyTorch build, but torch.version.cuda is {torch_cuda!r}."
     )
+if not torchcomms.is_backend_built("ncclx"):
+    raise SystemExit("TorchComms was not built with its NCCLX backend.")
 
 dataset_probe = Dataset.from_dict({"value": [1]})
 if dataset_probe[0]["value"] != 1:
@@ -348,8 +556,14 @@ print(
     f"datasets: {datasets_version} "
     f"(fsspec {fsspec_version}, PyArrow {pyarrow.__version__})"
 )
+print(f"mscclpp: {mscclpp_version}")
 print(f"purlin: {purlin_version}")
 print(f"torch: {torch.__version__} (CUDA {torch_cuda})")
+print(
+    "torchcomms: "
+    f"{importlib.metadata.version('torchcomms')} "
+    f"(backends: {', '.join(torchcomms.built_backends())})"
+)
 print(f"sglang: {importlib.metadata.version('sglang')}")
 print(f"diffusers: {importlib.metadata.version('diffusers')}")
 print(
@@ -362,10 +576,40 @@ PY
 SGLANG_HELP="$(${SGLANG_BIN} serve --help)"
 [[ "${SGLANG_HELP}" == *"--enable-purlin"* ]] || \
     die "sglang serve does not expose --enable-purlin"
+[[ "${SGLANG_HELP}" == *"--enable-torchcomms"* ]] || \
+    die "sglang serve does not expose --enable-torchcomms"
+[[ "${SGLANG_HELP}" == *"--enable-mscclpp"* ]] || \
+    die "sglang serve does not expose --enable-mscclpp"
+
+CURRENT_STEP="TorchComms CUDA image verification"
+log "Verifying TorchComms CUDA images"
+mapfile -t TORCHCOMMS_LIBRARIES < <(
+    "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+
+import torchcomms
+
+for library in sorted(Path(torchcomms.__file__).parent.glob("*.so")):
+    print(library)
+PY
+)
+((${#TORCHCOMMS_LIBRARIES[@]} > 0)) || \
+    die "could not find the installed TorchComms shared libraries"
+CUOBJDUMP="${CUDA_HOME}/bin/cuobjdump"
+[[ -x "${CUOBJDUMP}" ]] || die "cuobjdump was not found at ${CUOBJDUMP}"
+TORCHCOMMS_CUOBJDUMP_OUTPUT="$(${CUOBJDUMP} --list-elf "${TORCHCOMMS_LIBRARIES[@]}")"
+for architecture in "${TORCHCOMMS_CUDA_IMAGES[@]}"; do
+    grep -q "${architecture}" <<<"${TORCHCOMMS_CUOBJDUMP_OUTPUT}" || \
+        die "TorchComms is missing the required ${architecture} CUDA image"
+done
+echo "Verified TorchComms CUDA images: ${TORCHCOMMS_CUDA_IMAGE_LABEL}"
 
 log "Installation complete"
 printf 'Environment: %s\n' "${VENV_DIR}"
 printf 'CUDA toolkit: %s\n' "${CUDA_RELEASE}"
+printf 'MSCCL++: %s\n' "${MSCCLPP_VERSION}"
 printf 'Purlin: %s\n' "${PURLIN_VERSION}"
+printf 'TorchComms revision: %s\n' "${TORCHCOMMS_GIT_REVISION}"
+printf 'TorchComms CUDA images: %s\n' "${TORCHCOMMS_CUDA_IMAGE_LABEL}"
 printf 'Datasets: %s\n' "${DATASETS_VERSION}"
 printf '\nActivate it with:\n  source %q\n' "${VENV_DIR}/bin/activate"

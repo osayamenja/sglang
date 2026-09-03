@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class PyMscclppCommunicator:
-    _SUPPORTED_WORLD_SIZES = [8, 16, 32]
+    _NATIVE_WORLD_SIZES = [2, 4, 8]
+    _DSL_ALLREDUCE_WORLD_SIZES = [16, 32]
+    _SUPPORTED_WORLD_SIZES = _NATIVE_WORLD_SIZES + _DSL_ALLREDUCE_WORLD_SIZES
+    _SUPPORTED_ALLGATHER_WORLD_SIZES = _NATIVE_WORLD_SIZES
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
     def _is_symm_mem_enabled(self) -> bool:
@@ -92,7 +95,7 @@ class PyMscclppCommunicator:
         return dsl_algos_config
 
     def _create_native_algorithms(self):
-        navitve_algorithms_config = []
+        native_allreduce_algorithms_config = []
         dlpack = self.mscclpp.RawGpuBuffer(1 << 27).to_dlpack(
             data_type=str(torch.float16)
         )
@@ -105,37 +108,46 @@ class PyMscclppCommunicator:
         )
 
         for algo in algos:
-            if algo.name == "default_allreduce_nvls_packet":
+            if self.nvls_supported and algo.name == "default_allreduce_nvls_packet":
                 algo.set_message_size_range(0, 512 << 10)
-                navitve_algorithms_config.append(
+                native_allreduce_algorithms_config.append(
                     (algo, [4, 8, 12, 16], [256, 512, 768, 1024])
                 )
             if algo.name == "default_allreduce_packet":
                 algo.set_message_size_range(0, 2 << 20)
-                navitve_algorithms_config.append(
+                native_allreduce_algorithms_config.append(
                     (algo, [14, 21, 28, 42, 56], [256, 512, 768, 1024])
                 )
-            if algo.name == "default_allreduce_rsag_zero_copy":
+            if (
+                self.nranks_per_node in (4, 8)
+                and algo.name == "default_allreduce_rsag_zero_copy"
+            ):
                 algo.set_message_size_range(512 << 10, 4 << 30)
-                navitve_algorithms_config.append(
+                native_allreduce_algorithms_config.append(
                     (algo, [32, 48, 64, 128], [256, 512, 768, 1024])
                 )
             if (
-                self.symm_mem_enabled
+                self.nvls_supported
+                and self.symm_mem_enabled
                 and algo.name == "default_allreduce_nvls_zero_copy"
             ):
                 algo.set_message_size_range(512 << 10, 4 << 30)
-                navitve_algorithms_config.append(
+                native_allreduce_algorithms_config.append(
                     (algo, [4, 8, 12, 16, 32], [256, 512, 768, 1024])
                 )
+            if algo.name == "default_allgather_fullmesh2":
+                # Let the native implementation choose its launch dimensions.
+                # It communicates 32-bit chunks, so eligibility below enforces
+                # that the per-rank input size is a multiple of four bytes.
+                self.allgather_config = (algo, 0, 0)
 
-        return navitve_algorithms_config
+        return native_allreduce_algorithms_config
 
     def _create_algorithms(self):
-        if self.world_size == 8:
+        if self.world_size in PyMscclppCommunicator._NATIVE_WORLD_SIZES:
             self.algos_config = self._create_native_algorithms()
             self._tune(5, 10, 20, self.algos_config)
-        elif self.world_size == 16 or self.world_size == 32:
+        elif self.world_size in PyMscclppCommunicator._DSL_ALLREDUCE_WORLD_SIZES:
             self.dsl_algos_config = self._create_dsl_algorithms()
             self._tune(5, 10, 20, self.dsl_algos_config)
 
@@ -269,6 +281,31 @@ class PyMscclppCommunicator:
             symmetric_memory=sym_mem_enabled,
         )
 
+    def _run_allgather_algo(
+        self,
+        algo,
+        output: torch.Tensor,
+        inp: torch.Tensor,
+        nblocks: int,
+        nthreads: int,
+    ):
+        return algo.execute(
+            comm=self.comm.communicator,
+            executor=self.executor,
+            input_buffer=inp.data_ptr(),
+            output_buffer=output.data_ptr(),
+            input_size=inp.nbytes,
+            output_size=output.nbytes,
+            dtype=self.dtype_to_mscclpp_dtype(inp.dtype),
+            op=self.mscclpp.ReduceOp.NOP,
+            stream=torch.cuda.current_stream().cuda_stream,
+            nblocks=nblocks,
+            nthreads_per_block=nthreads,
+            # all_gather_into_tensor outputs are not guaranteed to come from
+            # SGLang's symmetric allocator.
+            symmetric_memory=False,
+        )
+
     def __init__(
         self,
         group: ProcessGroup,
@@ -280,11 +317,25 @@ class PyMscclppCommunicator:
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bind to f"cuda:{local_rank}".
         It is the caller's responsibility to make sure each communicator
-        is bind to a unique device, and all communicators in this group
-        are in the same node.
+        is bound to a unique device. Native communicators (sizes 2, 4, and
+        8) must be contained within one node.
         """
-        self._IS_CAPTURING = False
         self.disabled = True
+        self.available = False
+        self.initialized = False
+        self.group = group
+        self.rank = dist.get_rank(group=group)
+        self.world_size = dist.get_world_size(group=group)
+        self.ranks = torch.distributed.get_process_group_ranks(group)
+        self.device = None
+        self.comm = None
+        self.executor = None
+        self.scratch_buffer = None
+        self.flag_buffer = None
+        self.algos_config = []
+        self.dsl_algos_config = []
+        self.allgather_config = None
+        self.best_configs = {}
 
         try:
             self.mscclpp = importlib.import_module("mscclpp")
@@ -296,32 +347,28 @@ class PyMscclppCommunicator:
             return
 
         self.available = True
-        self.group = group
 
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        ), "PyMscclpp should be attached to a non-NCCL group."
 
-        rank = dist.get_rank(group=self.group)
-        world_size = dist.get_world_size(group=self.group)
-        if world_size == 1:
+        if self.world_size == 1:
             # No need to initialize mscclpp for single GPU case.
             return
 
-        if world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES:
+        if self.world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES:
             logger.warning(
                 "PyMscclpp is disabled due to an unsupported world"
                 " size: %d. Supported world sizes: %s. To silence this "
                 "warning, specify disable_mscclpp=True explicitly.",
-                world_size,
+                self.world_size,
                 str(PyMscclppCommunicator._SUPPORTED_WORLD_SIZES),
             )
             return
 
-        self.ranks = torch.distributed.get_process_group_ranks(group)
-        self.nranks_per_node = torch.cuda.device_count()
         # for now mscclpp with stride in the communicator is not tested
-        if not (abs(self.ranks[-1] - self.ranks[0]) == world_size - 1):
+        expected_ranks = list(range(self.ranks[0], self.ranks[0] + self.world_size))
+        if self.ranks != expected_ranks:
             logger.warning(
                 "PyMscclpp is disabled due to an unsupported group %s."
                 "Please ensure all ranks in the group are consecutive."
@@ -329,6 +376,18 @@ class PyMscclppCommunicator:
                 str(self.ranks),
             )
             return
+
+        if self.world_size in PyMscclppCommunicator._NATIVE_WORLD_SIZES:
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+            if not all(in_the_same_node_as(group, source_rank=0)):
+                logger.warning(
+                    "PyMscclpp is disabled for communicator size %d because "
+                    "the process group spans multiple nodes. Native MSCCL++ "
+                    "collectives require a single-node group.",
+                    self.world_size,
+                )
+                return
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -338,33 +397,39 @@ class PyMscclppCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
 
-        self.rank = rank
-        self.world_size = world_size
         self.comm = self.mscclpp.CommGroup(
-            torch_group=self.group, rank=rank, size=world_size
+            torch_group=self.group, rank=self.rank, size=self.world_size
         )
+        self.nranks_per_node = self.comm.nranks_per_node
         self.executor = self.mscclpp.Executor(self.comm.communicator)
         self.symm_mem_enabled = self._is_symm_mem_enabled()
-        self.best_configs = {}
+        self.nvls_supported = self.mscclpp.is_nvls_supported()
         self._create_algorithms()
+        self.initialized = True
 
     def destroy(self):
-        self.algos_config = None
-        self.best_configs = None
+        self.algos_config = []
+        self.dsl_algos_config = []
+        self.allgather_config = None
+        self.best_configs = {}
         self.executor = None
         self.scratch_buffer = None
         self.flag_buffer = None
         self.comm = None
+        self.initialized = False
 
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
     ) -> bool:
         if (
             self.disabled
+            or not self.initialized
             or self.world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES
         ):
             return False
         if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
+            return False
+        if inp.device.type != "cuda" or inp.device != self.device:
             return False
         if not self._is_weak_contiguous(inp):
             return False
@@ -375,6 +440,35 @@ class PyMscclppCommunicator:
         # mscclpp must not be used during any piecewise CUDA graph phase
         # (compile, capture, or replay) as it changes the allreduce dispatch
         # path and triggers recompilation.
+        if (
+            is_in_tc_piecewise_cuda_graph()
+            or is_in_torch_compile_warmup()
+            or get_pcg_capture_stream() is not None
+        ):
+            return False
+        return True
+
+    def should_mscclpp_allgather(self, output: torch.Tensor, inp: torch.Tensor) -> bool:
+        if (
+            self.disabled
+            or not self.initialized
+            or self.world_size
+            not in PyMscclppCommunicator._SUPPORTED_ALLGATHER_WORLD_SIZES
+            or self.allgather_config is None
+        ):
+            return False
+        if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
+            return False
+        if inp.device.type != "cuda" or inp.device != self.device:
+            return False
+        if output.dtype != inp.dtype or output.device != inp.device:
+            return False
+        if not self._is_weak_contiguous(inp) or not output.is_contiguous():
+            return False
+        if inp.nbytes == 0 or inp.nbytes % 4 != 0:
+            return False
+        if output.nbytes != inp.nbytes * self.world_size:
+            return False
         if (
             is_in_tc_piecewise_cuda_graph()
             or is_in_torch_compile_warmup()
@@ -407,15 +501,28 @@ class PyMscclppCommunicator:
         self._run_algo(algo, tensor, nbytes, nblocks, nthreads, self.symm_mem_enabled)
         return tensor
 
+    def all_gather(
+        self,
+        output: torch.Tensor,
+        inp: torch.Tensor,
+        stream: torch.cuda.Stream = None,
+    ):
+        algo, nblocks, nthreads = self.allgather_config
+        result = self._run_allgather_algo(algo, output, inp, nblocks, nthreads)
+        if result != 0:
+            raise RuntimeError(f"MSCCL++ all-gather failed with result code {result}")
+        return output
+
     @contextmanager
     def change_state(
         self,
         enable: Optional[bool] = None,
     ):
-        if enable is None or self.available is False:
+        if enable is None:
             # guess a default value when not specified
-            # DO: Decided if raise an exception here or not
-            enable = self.available
+            enable = self.initialized
+        elif not self.initialized:
+            enable = False
 
         old_disable = self.disabled
         self.disabled = not enable

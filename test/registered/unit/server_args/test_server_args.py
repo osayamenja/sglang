@@ -104,6 +104,31 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_communication_backend_flags_are_mutually_exclusive(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(["--model-path", "dummy", "--enable-torchcomms"])
+        server_args = ServerArgs.from_cli_args(parsed)
+        self.assertTrue(server_args.enable_torchcomms)
+
+        conflicting = ServerArgs(
+            model_path="dummy",
+            enable_purlin=True,
+            enable_torchcomms=True,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            conflicting.check_server_args()
+
+        for other_backend in ("enable_purlin", "enable_torchcomms"):
+            with self.subTest(other_backend=other_backend):
+                conflicting = ServerArgs(
+                    model_path="dummy",
+                    enable_mscclpp=True,
+                    **{other_backend: True},
+                )
+                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                    conflicting.check_server_args()
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",

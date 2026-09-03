@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_purlin,
     set_torch_symm_mem_all_reduce,
+    set_torchcomms,
 )
 from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
@@ -200,6 +201,7 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_purlin(server_args.enable_purlin)
+    set_torchcomms(server_args.enable_torchcomms)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None

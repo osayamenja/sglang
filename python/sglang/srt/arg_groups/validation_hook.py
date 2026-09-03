@@ -29,6 +29,18 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    communication_backends = [
+        flag
+        for flag, enabled in (
+            ("--enable-mscclpp", cfg.enable_mscclpp),
+            ("--enable-purlin", cfg.enable_purlin),
+            ("--enable-torchcomms", cfg.enable_torchcomms),
+        )
+        if enabled
+    ]
+    if len(communication_backends) > 1:
+        raise ValueError(f"{', '.join(communication_backends)} are mutually exclusive.")
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (

@@ -187,6 +187,7 @@ def init_parallel_group_coordinator(
     backend: str,
     parallel_mode: str,
     enable_purlin: bool = False,
+    enable_torchcomms: bool = False,
     **kwargs,
 ) -> GroupCoordinator:
     """Return a group coordinator for the given parallel mode."""
@@ -214,6 +215,7 @@ def init_parallel_group_coordinator(
             torch_distributed_backend=backend,
             group_name="sp_group",
             enable_purlin=enable_purlin,
+            enable_torchcomms=enable_torchcomms,
             **kwargs,
         )
     else:
@@ -231,6 +233,7 @@ def init_parallel_group_coordinator(
             use_srt_custom_allreduce=parallel_mode == "tensor",
             group_name=group_name,
             enable_purlin=enable_purlin,
+            enable_torchcomms=enable_torchcomms,
         )
 
 
@@ -385,6 +388,7 @@ def initialize_model_parallel(
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
     enable_purlin: bool = False,
+    enable_torchcomms: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -470,6 +474,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
 
     global _CFG
@@ -480,6 +485,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="classifier_free_guidance",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
@@ -489,6 +495,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="pipeline",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
 
     global _SP
@@ -526,6 +533,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="sequence",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
         ulysses_group=PROCESS_GROUP.ULYSSES_PG,
         ring_group=PROCESS_GROUP.RING_PG,
     )
@@ -538,6 +546,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
     _sync_srt_tp_group()
 
@@ -607,6 +616,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="vae_decode",
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
 
     if vae_parallel_size > 0:
@@ -654,6 +664,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
     enable_purlin: bool = False,
+    enable_torchcomms: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -696,6 +707,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
         enable_purlin=enable_purlin,
+        enable_torchcomms=enable_torchcomms,
     )
 
 
@@ -761,6 +773,11 @@ def destroy_distributed_environment() -> None:
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    from sglang.srt.distributed.device_communicators.torchcomms_adapter import (
+        finalize_torchcomms,
+    )
+
+    finalize_torchcomms()
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 

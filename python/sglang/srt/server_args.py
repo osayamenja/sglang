@@ -1997,12 +1997,18 @@ class ServerArgs:
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for supported all-reduce and all-gather calls and fall back to NCCL.",
         NS("exec.comm"),
     ] = False
     enable_purlin: A[
         bool,
         "Enable the Purlin communication library for supported CUDA collectives.",
+        NS("exec.comm"),
+    ] = False
+    enable_torchcomms: A[
+        bool,
+        "Enable the torchcomms NCCLX backend for supported CUDA collectives.",
+        NS("exec.comm"),
     ] = False
     enable_torch_symm_mem: A[
         bool,

@@ -434,6 +434,21 @@ class GroupCoordinator:
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
+        communication_backends = [
+            name
+            for name, enabled in (
+                ("MSCCL++", use_pymscclpp),
+                ("Purlin", _ENABLE_PURLIN),
+                ("torchcomms", _ENABLE_TORCHCOMMS),
+            )
+            if enabled
+        ]
+        if len(communication_backends) > 1:
+            raise ValueError(
+                f"{', '.join(communication_backends)} communication backends "
+                "are mutually exclusive."
+            )
+
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
@@ -563,6 +578,21 @@ class GroupCoordinator:
                 stream_ptr=get_current_device_stream_fast().cuda_stream,
             )
 
+        self.torchcomms_comm: Optional[Any] = None
+        self.enable_torchcomms = (
+            _ENABLE_TORCHCOMMS and is_cuda() and self.world_size > 1
+        )
+        if self.enable_torchcomms:
+            from sglang.srt.distributed.device_communicators.torchcomms_adapter import (
+                TorchCommsCommunicator,
+            )
+
+            self.torchcomms_comm = TorchCommsCommunicator(
+                ranks=self.ranks,
+                device=self.device,
+                name=self.unique_name,
+            )
+
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -608,6 +638,15 @@ class GroupCoordinator:
         if require_reduce_dtype and tensors[0].dtype not in _PURLIN_REDUCE_DTYPES:
             return False
         return True
+
+    def _can_use_torchcomms(
+        self,
+        *tensors: torch.Tensor,
+        require_reduce_dtype: bool = False,
+    ) -> bool:
+        return self.torchcomms_comm is not None and self.torchcomms_comm.can_use(
+            *tensors, require_reduce_dtype=require_reduce_dtype
+        )
 
     def _purlin_stream_ptr(self) -> int:
         return get_current_device_stream_fast().cuda_stream
@@ -755,7 +794,9 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self._can_use_purlin(input_, require_reduce_dtype=True):
+        if self._can_use_torchcomms(
+            input_, require_reduce_dtype=True
+        ) or self._can_use_purlin(input_, require_reduce_dtype=True):
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
@@ -1082,6 +1123,10 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        if self._can_use_torchcomms(input_, require_reduce_dtype=True):
+            self.torchcomms_comm.all_reduce(input_)
+            return
+
         if self._can_use_purlin(input_, require_reduce_dtype=True):
             self.purlin.all_reduce(
                 input_, input_, self.purlin_handle, self._purlin_stream_ptr()
@@ -1143,6 +1188,14 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if (
+            self._can_use_torchcomms(input, output, require_reduce_dtype=True)
+            and input.numel() % self.world_size == 0
+            and output.numel() == input.numel() // self.world_size
+        ):
+            self.torchcomms_comm.reduce_scatter(output, input)
+            return output
+
         if (
             self._can_use_purlin(input, output, require_reduce_dtype=True)
             and input.nbytes % self.world_size == 0
@@ -1229,6 +1282,14 @@ class GroupCoordinator:
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         if (
+            self._can_use_torchcomms(input, output)
+            and input.shape[0] == output.shape[0]
+            and input.shape[0] % self.world_size == 0
+        ):
+            self.torchcomms_comm.all_to_all(output, input)
+            return
+
+        if (
             self._can_use_purlin(input, output)
             and input.nbytes == output.nbytes
             and input.nbytes % self.world_size == 0
@@ -1281,6 +1342,10 @@ class GroupCoordinator:
             output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
         else:
             assert output.shape == output_shape
+
+        if self._can_use_torchcomms(input_, output, require_reduce_dtype=True):
+            self.torchcomms_comm.reduce_scatter(output, input_, sizes=sizes)
+            return output
 
         if self._can_use_purlin(input_, output, require_reduce_dtype=True):
             if sizes is not None and any(size != sizes[0] for size in sizes):
@@ -1341,6 +1406,20 @@ class GroupCoordinator:
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
+
+        if (
+            self._can_use_torchcomms(input, output)
+            and output.numel() == input.numel() * self.world_size
+        ):
+            self.torchcomms_comm.all_gather(output, input)
+            return
+
+        pymscclpp_comm = self.pymscclpp_comm
+        if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
+            output, input
+        ):
+            pymscclpp_comm.all_gather(output, input)
+            return
 
         if (
             self._can_use_purlin(input, output)
@@ -1525,6 +1604,13 @@ class GroupCoordinator:
             )
             output_list.append(output_tensor)
             size_list.append(s)
+
+        if all(
+            self._can_use_torchcomms(inp, out) for inp, out in zip(input_, output_list)
+        ):
+            for inp, out, s in zip(input_, output_list, size_list):
+                self.torchcomms_comm.all_gather(out, inp, sizes=s)
+            return output_list
 
         if all(self._can_use_purlin(inp, out) for inp, out in zip(input_, output_list)):
             can_use_purlin_for_sizes = all(
@@ -1983,6 +2069,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.torchcomms_comm is not None:
+            self.torchcomms_comm.finalize()
+            self.torchcomms_comm = None
         if self.purlin_handle is not None:
             self.purlin.finalize(
                 self.purlin_handle,
@@ -2262,6 +2351,7 @@ _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 _ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 _ENABLE_PURLIN = False
+_ENABLE_TORCHCOMMS = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2277,6 +2367,11 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_purlin(enable: bool):
     global _ENABLE_PURLIN
     _ENABLE_PURLIN = enable
+
+
+def set_torchcomms(enable: bool):
+    global _ENABLE_TORCHCOMMS
+    _ENABLE_TORCHCOMMS = enable
 
 
 def set_torch_symm_mem_all_reduce(enable: bool):
@@ -3198,6 +3293,11 @@ def destroy_distributed_environment():
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    from sglang.srt.distributed.device_communicators.torchcomms_adapter import (
+        finalize_torchcomms,
+    )
+
+    finalize_torchcomms()
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

@@ -306,6 +306,7 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
     enable_purlin: bool = False
+    enable_torchcomms: bool = False
     scheduler_rpc_timeout: int | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
@@ -605,6 +606,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        if self.enable_purlin and self.enable_torchcomms:
+            raise ValueError(
+                "--enable-purlin and --enable-torchcomms are mutually exclusive."
+            )
         self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
         self._validate_offload()
@@ -2207,6 +2212,12 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.enable_purlin,
             help="Enable the Purlin communication library for supported CUDA collectives.",
+        )
+        parser.add_argument(
+            "--enable-torchcomms",
+            action=StoreBoolean,
+            default=ServerArgs.enable_torchcomms,
+            help="Enable the torchcomms NCCLX backend for supported CUDA collectives.",
         )
         parser.add_argument(
             "--scheduler-rpc-timeout",
