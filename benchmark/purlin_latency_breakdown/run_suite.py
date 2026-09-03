@@ -231,6 +231,8 @@ def common_server_command(args: argparse.Namespace, variant: str) -> list[str]:
         command.extend(("--revision", args.revision))
     if args.enable_dp_attention:
         command.append("--enable-dp-attention")
+    if args.enable_prefill_delayer:
+        command.append("--enable-prefill-delayer")
     if args.trust_remote_code:
         command.append("--trust-remote-code")
     if args.cuda_graph_backend_prefill is not None:
@@ -369,6 +371,7 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
             "cuda_graph_backend_prefill": args.cuda_graph_backend_prefill,
             "cuda_graph_bs_prefill": args.cuda_graph_bs_prefill,
             "enable_dp_attention": args.enable_dp_attention,
+            "enable_prefill_delayer": args.enable_prefill_delayer,
             "trust_remote_code": args.trust_remote_code,
             "extra_args": args.server_arg,
         },
@@ -539,6 +542,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ep", type=int, default=1)
     parser.add_argument(
         "--enable-dp-attention", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--enable-prefill-delayer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the server prefill delayer so attention-DP ranks admit "
+            "prefills together for clean TTFT breakdowns."
+        ),
     )
     parser.add_argument(
         "--trust-remote-code", action=argparse.BooleanOptionalAction, default=True
