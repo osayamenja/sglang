@@ -2,11 +2,13 @@ import json
 import re
 import sqlite3
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from sglang.benchmark import one_batch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 BENCHMARK_DIR = (
@@ -19,10 +21,213 @@ CUSTOM_ALL_REDUCE_HEADER = (
 sys.path.insert(0, str(BENCHMARK_DIR))
 
 import analyze_full_trace as trace  # noqa: E402
+import analyze_one_batch_trace as one_batch_trace  # noqa: E402
+import run_one_batch_suite as one_batch_suite  # noqa: E402
 import run_suite as suite  # noqa: E402
+import summarize_one_batch_results as one_batch_summary  # noqa: E402
 import summarize_results as summary  # noqa: E402
 
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestOneBatchSuite(unittest.TestCase):
+    def _parse_args(self, *extra):
+        argv = [
+            "run_one_batch_suite.py",
+            "--model",
+            "test-model",
+            "--tp",
+            "2",
+            "--output-dir",
+            "test-output",
+            *extra,
+        ]
+        with patch.object(sys, "argv", argv):
+            return one_batch_suite.parse_args()
+
+    def test_matched_commands_only_enable_purlin_for_purlin(self):
+        args = self._parse_args("--repeats", "3")
+        self.assertEqual(args.cuda_graph_backend_prefill, "breakable")
+        self.assertEqual(args.cuda_graph_bs_prefill, [1024])
+        baseline = one_batch_suite.one_batch_command(
+            args, "baseline", Path("baseline.jsonl"), repeats=3
+        )
+        purlin = one_batch_suite.one_batch_command(
+            args, "purlin", Path("purlin.jsonl"), repeats=3
+        )
+
+        self.assertNotIn("--enable-purlin", baseline)
+        self.assertIn("--enable-purlin", purlin)
+        batch_index = baseline.index("--batch-size")
+        self.assertEqual(baseline[batch_index + 1 : batch_index + 4], ["1"] * 3)
+        self.assertEqual(
+            baseline[baseline.index("--tp-size") + 1],
+            "2",
+        )
+
+    def test_default_nsys_binary_and_node_trace(self):
+        args = self._parse_args()
+        self.assertEqual(args.nsys_command, one_batch_suite.DEFAULT_NSYS)
+        with patch.object(one_batch_suite.subprocess, "run") as run:
+            run.return_value.stdout = "--cuda-graph-trace=<granularity>"
+            self.assertEqual(
+                one_batch_suite.resolve_cuda_graph_trace_mode(args), "node"
+            )
+
+        command = one_batch_suite.nsys_command(
+            args, ["python", "benchmark.py"], Path("trace"), "node"
+        )
+        self.assertEqual(command[0], str(one_batch_suite.DEFAULT_NSYS))
+        self.assertIn("--cuda-graph-trace=node", command)
+        self.assertIn("--capture-range=cudaProfilerApi", command)
+
+    def test_resume_rejects_a_different_configuration(self):
+        args = self._parse_args()
+        manifest = one_batch_suite.build_manifest(args, "node")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(manifest))
+            one_batch_suite.validate_resume_manifest(args, "node", path)
+            args.batch_size = 2
+            with self.assertRaisesRegex(ValueError, "configuration differs"):
+                one_batch_suite.validate_resume_manifest(args, "node", path)
+
+    def test_clean_summary_uses_medians_and_directional_speedup(self):
+        records = [
+            {
+                "prefill_latency": 0.012,
+                "median_decode_latency": 0.002,
+                "total_latency": 0.020,
+            },
+            {
+                "prefill_latency": 0.010,
+                "median_decode_latency": 0.001,
+                "total_latency": 0.018,
+            },
+        ]
+        summarized = one_batch_suite.summarize_samples(records)
+        self.assertEqual(summarized["metrics"]["prefill_latency"]["median"], 11.0)
+        comparison = one_batch_suite.compare_variants(
+            {
+                "baseline": summarized,
+                "purlin": one_batch_suite.summarize_samples(
+                    [
+                        {
+                            "prefill_latency": 0.0055,
+                            "median_decode_latency": 0.00075,
+                            "total_latency": 0.0095,
+                        }
+                    ]
+                ),
+            }
+        )
+        self.assertEqual(comparison["prefill_latency"]["purlin_speedup"], 2.0)
+
+    def test_static_trace_breakdown_is_additive(self):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript("""
+            CREATE TABLE StringIds (id INTEGER, value TEXT);
+            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+                deviceId INTEGER, start INTEGER, end INTEGER,
+                shortName INTEGER, graphId INTEGER, streamId INTEGER
+            );
+            INSERT INTO StringIds VALUES (1, 'compute_kernel');
+            INSERT INTO StringIds VALUES (2, 'allGatherKernel');
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0, 100, 180, 1, 7, 1);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0, 160, 220, 2, 7, 2);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0, 240, 260, 1, NULL, 1);
+            """)
+
+        result = one_batch_trace.analyze_trace(
+            connection, label="baseline", stage="decode"
+        )
+
+        critical = result["critical_path"]
+        self.assertEqual(critical["additive_error_ns"], 0)
+        self.assertEqual(critical["compute_active_ms"], 0.0001)
+        self.assertEqual(critical["communication_active_ms"], 0.00006)
+        self.assertEqual(critical["compute_communication_overlap_ms"], 0.00002)
+        self.assertEqual(critical["uncovered_ms"], 0.00002)
+
+    def test_cuda_profiler_sentinel_stops_without_torch_trace_export(self):
+        with (
+            patch.object(one_batch.torch.cuda, "cudart") as cudart,
+            patch.object(one_batch, "_save_profile_trace_results") as save_trace,
+        ):
+            profiler = one_batch.start_profile(["CUDA_PROFILER"])
+            one_batch.stop_profile(
+                profiler,
+                ["CUDA_PROFILER"],
+                save_trace=True,
+                trace_filename="unused.trace.json.gz",
+                stage="decode",
+            )
+
+        self.assertEqual(profiler, "cuda_profiler")
+        cudart.return_value.cudaProfilerStart.assert_called_once_with()
+        cudart.return_value.cudaProfilerStop.assert_called_once_with()
+        save_trace.assert_not_called()
+
+    def test_comparison_uses_static_prefill_decode_and_derived_e2e(self):
+        clean_summary = {
+            "variants": {
+                variant: {
+                    "samples": 8,
+                    "metrics": {
+                        "prefill_latency": {"median": values[0]},
+                        "median_decode_latency": {"median": values[1]},
+                        "total_latency": {"median": values[2]},
+                    },
+                }
+                for variant, values in {
+                    "baseline": (10.0, 2.0, 14.0),
+                    "purlin": (8.0, 1.0, 10.0),
+                }.items()
+            }
+        }
+        manifest = {"workload": {"output_len": 3}}
+
+        def breakdown(total, compute, communication, uncovered, overlap=0.0):
+            return {
+                "critical_device": 0,
+                "critical_path": {
+                    "span_ms": total,
+                    "compute_active_ms": compute,
+                    "communication_active_ms": communication + overlap,
+                    "communication_exclusive_ms": communication,
+                    "compute_communication_overlap_ms": overlap,
+                    "uncovered_ms": uncovered,
+                },
+            }
+
+        breakdowns = {
+            "baseline": {
+                "prefill": breakdown(10.0, 6.0, 3.0, 1.0),
+                "decode": breakdown(2.0, 1.0, 0.5, 0.5),
+            },
+            "purlin": {
+                "prefill": breakdown(8.0, 6.0, 1.0, 1.0),
+                "decode": breakdown(1.0, 0.7, 0.2, 0.1),
+            },
+        }
+
+        result = one_batch_summary.build_comparison(clean_summary, manifest, breakdowns)
+
+        self.assertEqual(
+            set(result["metrics"]),
+            {
+                "prefill_latency",
+                "decode_latency",
+                "e2e_time",
+            },
+        )
+        e2e = result["metrics"]["e2e_time"]
+        self.assertEqual(e2e["clean_static"]["baseline_ms"], 14.0)
+        self.assertEqual(e2e["trace_model"]["total"]["baseline_ms"], 14.0)
+        self.assertEqual(e2e["trace_model"]["compute"]["baseline_ms"], 8.0)
+        self.assertEqual(e2e["trace_model"]["communication"]["baseline_ms"], 4.0)
+        self.assertEqual(e2e["trace_model"]["uncovered"]["baseline_ms"], 2.0)
+        self.assertEqual(result["trace_derivation"]["decode_steps_in_e2e"], 2)
 
 
 class TestRunSuiteDefaults(unittest.TestCase):

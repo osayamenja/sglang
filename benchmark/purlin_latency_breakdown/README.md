@@ -91,6 +91,58 @@ tokenization, scheduling outside model forwards, and detokenization; clean
 client TTFT/TPOT/E2E values are retained as production references rather than
 misclassifying that residual as communication.
 
+## Static one-batch companion
+
+Use `run_one_batch_suite.py` when the serving trace is too noisy and the goal
+is to isolate model-forward behavior. It invokes
+`python -m sglang.benchmark.one_batch` directly, runs repeated clean
+baseline/Purlin measurements after one model warmup, then launches separate
+Nsight processes for exactly one prefill and one selected decode region:
+
+```bash
+.venv/bin/python benchmark/purlin_latency_breakdown/run_one_batch_suite.py \
+  --model Qwen/Qwen3.5-35B-A3B \
+  --tp 2 --dp 2 --ep 2 \
+  --batch-size 4 --input-len 1024 --output-len 1024 \
+  --repeats 8 \
+  --output-dir benchmark_results/qwen35_one_batch
+```
+
+`--batch-size` is the static batch shape, not client concurrency. With the
+default breakable prefill graph, the runner automatically captures the exact
+`batch_size * input_len` token shape (4096 in this example); an explicit
+`--cuda-graph-bs-prefill` overrides it.
+
+On systems where it exists, `/usr/local/bin/nsys` is used by default; pass
+`--nsys-command` to select another installation. The runner probes Nsight's
+CUDA-graph support and uses node-level capture so graph kernels remain
+classifiable. Clean timing and instrumented traces are separate processes, so
+Nsight overhead never enters the reported clean medians. The generated
+`summary.json` reports prefill, median decode, and total static-batch latency;
+the per-stage `*_breakdown.json` files report compute, exclusive
+communication, overlap, and uncovered GPU-span time.
+
+When both variants and both trace stages are present, the runner also writes
+`comparison.json`. Its paper-facing metrics are `prefill_latency`,
+`decode_latency`, and `e2e_time`. The first two use their matching focused
+trace. Mechanistic E2E is derived as captured prefill plus
+`(output_len - 1) * representative captured decode`; its clean reference is
+SGLang's native total one-batch latency. Each trace comparison preserves the
+additive `total = compute + communication + uncovered` breakdown and reports
+communication-active time and compute/communication overlap as diagnostics.
+
+These numbers are deliberately not described as TTFT, TPOT, or end-to-end
+serving latency. The static path excludes request admission, scheduling, HTTP,
+tokenization, and detokenization. It is best used as complementary
+mechanistic evidence alongside the realistic results from `run_suite.py`.
+
+For a quick timing-only check, add `--skip-profile`. To profile only one stage,
+use `--profile-stages prefill` or `--profile-stages decode`. Extra
+`one_batch`/server flags can be appended with repeated
+`--server-arg=--flag=value` options. After an interrupted run, repeat the same
+command with `--resume` to reuse complete clean samples and traces while
+rerunning partial artifacts.
+
 ## Interpretation
 
 `summarize_results.py` describes baseline/Purlin changes separately for TTFT,

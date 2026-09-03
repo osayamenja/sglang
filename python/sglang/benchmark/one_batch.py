@@ -129,7 +129,9 @@ def start_profile(
             rank_print("CUDA Profiler started (nsys will begin capturing)")
         except Exception as e:
             rank_print(f"Failed to start CUDA profiler: {e}")
-        return None
+        # Keep a non-None sentinel so decode profiling can distinguish an
+        # active CUDA Profiler API range from a range that has already stopped.
+        return "cuda_profiler"
     else:
         activities = []
         if "CPU" in profile_activities:
@@ -174,7 +176,8 @@ def stop_profile(
             rank_print(f"MLX Metal gputrace {stage_desc} saved to {mlx_trace_filename}")
         return
 
-    if "CUDA_PROFILER" in profile_activities:
+    is_cuda_profiler = "CUDA_PROFILER" in profile_activities
+    if is_cuda_profiler:
         try:
             torch.cuda.cudart().cudaProfilerStop()
             rank_print("CUDA Profiler stopped (nsys should dump traces)")
@@ -184,7 +187,7 @@ def stop_profile(
         profiler.stop()
 
     if save_trace:
-        if profiler is not None:
+        if profiler is not None and not is_cuda_profiler:
             if trace_filename:
                 _save_profile_trace_results(
                     profiler, profile_activities, trace_filename
@@ -193,7 +196,7 @@ def stop_profile(
                 rank_print(
                     f"torch profiler chrome trace {stage_desc} saved to {trace_filename}"
                 )
-        if "CUDA_PROFILER" in profile_activities:
+        if is_cuda_profiler:
             rank_print(f"CUDA profiler trace for {stage} completed")
 
 
@@ -1076,8 +1079,9 @@ def main(server_args, bench_args):
 
         for proc in workers:
             proc.join()
-
-        proc.terminate()
+        failures = [(proc.pid, proc.exitcode) for proc in workers if proc.exitcode != 0]
+        if failures:
+            raise RuntimeError(f"one_batch worker processes failed: {failures}")
 
 
 def cli_main():
