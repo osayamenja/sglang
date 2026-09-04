@@ -731,6 +731,12 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # An empty tensor reduces to itself. Skip the backends outright: e.g.
+        # a DP-attention idle forward embeds zero tokens, and purlin sizes its
+        # grid from the byte count (a zero-block grid raises SIGFPE on host).
+        if input_.numel() == 0:
+            return input_
+
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
@@ -1143,6 +1149,11 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        # An empty input scatters nothing; skip the backends (purlin sizes its
+        # grid from the byte count, and a zero-block grid raises SIGFPE on host).
+        if input.numel() == 0:
+            return output
+
         if (
             self._can_use_purlin(input, output, require_reduce_dtype=True)
             and input.nbytes % self.world_size == 0
@@ -1309,6 +1320,11 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        # An empty input gathers nothing; skip the backends (purlin sizes its
+        # grid from the byte count, and a zero-block grid raises SIGFPE on host).
+        if input.numel() == 0:
+            return
+
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank

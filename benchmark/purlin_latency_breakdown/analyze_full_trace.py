@@ -1406,7 +1406,12 @@ def analyze_request_windows(
                 "TPOT requires at least two output tokens"
             )
         itls = client["itls"][request_index]
-        if len(itls) != output_len - 1:
+        # The client records one interval per token streamed after the first
+        # visible text. Leading tokens that decode to no visible text (e.g. a
+        # chat-format control token) are folded into its TTFT window, so a
+        # request may carry fewer intervals than output_len - 1; never more.
+        folded_leading_tokens = output_len - 1 - len(itls)
+        if folded_leading_tokens < 0 or not itls:
             raise ValueError(
                 f"Request {request_index} has {len(itls)} inter-token "
                 f"intervals for output length {output_len}"
@@ -1440,7 +1445,8 @@ def analyze_request_windows(
             overlap_tolerance_ns=overlap_tolerance_ns,
             context=f"{request_context} E2E window",
         )
-        inter_token_count = output_len - 1
+        # The decode window spans exactly the recorded intervals.
+        inter_token_count = len(itls)
         tpot = scale_components(decode, inter_token_count)
 
         ttft_values.append(ttft)
@@ -1452,6 +1458,7 @@ def analyze_request_windows(
                 "dp_rank": dp_rank,
                 "input_len": client["input_lens"][request_index],
                 "output_len": output_len,
+                "folded_leading_tokens": folded_leading_tokens,
                 "request_start_trace_ms": request_start * 1e-6,
                 "first_token_trace_ms": first_token * 1e-6,
                 "last_token_trace_ms": request_end * 1e-6,
