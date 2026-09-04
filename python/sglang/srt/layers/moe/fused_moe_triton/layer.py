@@ -1376,6 +1376,27 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
 
+    def _narrow_fused_weight_to_local_experts(
+        self, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Slice a fused expert tensor down to this rank's routed experts.
+
+        Fused checkpoints (e.g. the bf16 gpt-oss export) store every routed
+        expert in one tensor with the global expert count on dim 0, while the
+        parameter only holds this rank's slice under expert parallelism. Tensors
+        that a model already sliced to the local count pass through unchanged,
+        as does the ``FusedMoELoadingMixin`` helper, which carries no expert
+        bookkeeping.
+        """
+        num_global = getattr(self, "_num_global_routed", None)
+        num_local = getattr(self, "_num_local_routed", None)
+        if num_global is None or num_local is None or num_local == num_global:
+            return loaded_weight
+        if loaded_weight.dim() == 0 or loaded_weight.shape[0] != num_global:
+            return loaded_weight
+        start = self._expert_storage_rank * num_local
+        return loaded_weight.narrow(0, start, num_local)
+
     def weight_loader_fused(
         self,
         param: torch.nn.Parameter,
@@ -1412,6 +1433,8 @@ class FusedMoE(torch.nn.Module):
                 dim2 = loaded_weight.shape[2]
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
+
+        loaded_weight = self._narrow_fused_weight_to_local_experts(loaded_weight)
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
