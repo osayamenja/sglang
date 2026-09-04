@@ -339,6 +339,32 @@ def nsys_server_command(
     ]
 
 
+def report_capture_quality(summary_path: Path) -> None:
+    """Print the profiler-perturbation checks recorded in comparison.json."""
+
+    summary = json.loads(summary_path.read_text())
+    print("Capture quality (TPOT):", flush=True)
+    for variant, quality in summary["capture_quality"].items():
+        print(
+            f"  {variant}: profiled client vs markers "
+            f"{quality['profiled_client_vs_markers_tpot'] * 100:+.2f}%, "
+            "trace model (launch stall excluded) vs markers "
+            f"{quality['trace_model_vs_markers_tpot'] * 100:+.2f}%",
+            flush=True,
+        )
+        print(f"    {quality['assessment']}", flush=True)
+    for metric, values in summary["metrics"].items():
+        stall = values["launch_stall"]
+        print(
+            f"  {metric.upper()} launch stall separated: baseline "
+            f"{stall['baseline_ms']:.3f} ms "
+            f"({stall['baseline_fraction_of_raw_total'] * 100:.2f}%), purlin "
+            f"{stall['purlin_ms']:.3f} ms "
+            f"({stall['purlin_fraction_of_raw_total'] * 100:.2f}%)",
+            flush=True,
+        )
+
+
 def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
     manifest = {
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -379,6 +405,9 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
             "overlap_tolerance_ns": args.overlap_tolerance_ns,
             "additional_communication_kernel_names": args.communication_pattern,
             "require_prefill_cuda_graph": args.require_prefill_cuda_graph,
+            # comparison.json compares model time with the analyzer's
+            # launch_stall bucket excluded; see README "Launch-stall correction".
+            "launch_stall_correction": True,
         },
         "variants": args.variants,
         "skip_clean": args.skip_clean,
@@ -729,6 +758,7 @@ def main() -> None:
             check=True,
         )
         print(f"Wrote comparison: {summary_path}", flush=True)
+        report_capture_quality(summary_path)
     print(f"Suite complete: {args.output_dir}", flush=True)
 
 

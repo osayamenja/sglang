@@ -143,13 +143,80 @@ use `--profile-stages prefill` or `--profile-stages decode`. Extra
 command with `--resume` to reuse complete clean samples and traces while
 rerunning partial artifacts.
 
+## Launch-stall correction
+
+Nsight's node-level CUDA-graph tracing makes every host `cudaGraphLaunch`
+cost milliseconds for a decode graph with more than a thousand nodes. With the
+overlap scheduler that cost is hidden only while the GPU step is longer than
+the host work per step. When it is not, one rank's launch returns late, that
+rank idles before its first graph node, and every other rank spins inside the
+step's first collective waiting for it. The trace then books the same event as
+`uncovered` on the late rank and as `communication` on the others, and a
+variant with a short GPU step is penalised far more than a variant with a long
+one. The A100 concurrency-one pilot showed this directly: the Purlin profiled
+client was 24% slower than its marker-only client while baseline was 2.8%
+slower, and the raw trace lost most of Purlin's clean-run advantage.
+
+The analyzer therefore separates that wait into a fourth additive bucket,
+`launch_stall`, using only GPU-side evidence:
+
+```text
+s_r  = start of rank r's first communication kernel in the step
+g_r  = host-late idle on rank r before s_r: GPU-idle time, measured from the
+       earliest step start across ranks, during which the launch call of the
+       next kernel had not yet returned
+A    = max over ranks of s_r            (latest arrival at the first collective)
+A*   = max over ranks of (s_r - g_r)    (latest arrival with host-late idle removed)
+
+on the selected rank r:
+  launch_stall_from_uncovered     = the part of g_r inside the rank's own span
+  launch_stall_from_communication = communication-kernel time in [s_r, A],
+                                    capped at (A - A*) - g_r
+  launch_stall                    = the sum of both parts
+
+total                         = compute + communication + uncovered + launch_stall
+total_excluding_launch_stall  = compute + communication + uncovered
+```
+
+Whether a gap is host-late is read from the trace itself: every kernel record
+carries the CUDA runtime call that launched it (for a graph node, the
+`cudaGraphLaunch` call), and a gap counts only when that call returned after
+the gap began. GPU-side launch latency between kernels that were already
+queued, a few microseconds each in a healthy preamble, never qualifies, so the
+bucket is zero when the host stayed ahead. When the host falls behind, the
+late graph launch and the paced eager launches before it all qualify, so a
+stall that shows up as several gaps is captured whole. `A - A*` is how much
+the latest arrival would move if every rank's host-late idle were removed, so
+only that much of a peer's wait is moved out of communication; a wait for a
+rank that was busy computing stays classified as communication, as before.
+The bucket is bounded per rank by the larger of its own host-late idle and
+`A - A*`. In prefill, the eager preamble is host-paced even without a
+profiler, so its qualifying gaps are moved as well; they are reported per
+phase in `diagnostics.launch_stall_by_phase` so their size is visible.
+
+`communication` and `uncovered` in the breakdown are the corrected values.
+Every `critical_steps` entry also carries `communication_raw_ms`,
+`uncovered_raw_ms`, the arrival skew at the first collective, the late device,
+and its idle time, and the request-window mode clips the same stall intervals
+per request so the bucket exists at every concurrency. `comparison.json`
+compares `trace_model` with the bucket excluded, keeps the raw four-bucket
+totals as `trace_model_raw`, states the separated stall per variant, and checks
+the corrected model TPOT against the marker-only client TPOT in
+`validation.trace_model_vs_markers`. That check is the per-run signal that the
+correction recovered an unperturbed step: expect a few percent above the
+marker-only client from residual node-tracing overhead, not tens of percent.
+When plotting with the bucket dropped, state the separated amount.
+
 ## Interpretation
 
 `summarize_results.py` describes baseline/Purlin changes separately for TTFT,
 TPOT, and E2E. Its wording is derived from each signed delta: increased,
 decreased, or unchanged. It does not infer a mechanism or claim a consistent
 direction when the metrics are mixed. Stronger statistical or causal claims
-require repeated experiments and separate evidence.
+require repeated experiments and separate evidence. Its `capture_quality`
+block reports how far each profiled client run drifted from its marker-only
+run; above 5% the raw trace is flagged as perturbed and the launch-stall
+corrected `trace_model` block is the one to read.
 
 ## Prerequisites
 
@@ -358,7 +425,11 @@ variant with `--resume`.
   replay. At higher concurrency it clock-aligns each request with its own DP
   timeline.
 - `summarize_results.py` joins clean client metrics, marker-only calibration,
-  profiled client metrics, and traced model components into `comparison.json`.
+  profiled client metrics, and traced model components into `comparison.json`,
+  comparing model time with `launch_stall` excluded and validating it against
+  the marker-only client. `--breakdown-suffix` or explicit
+  `--baseline-breakdown`/`--purlin-breakdown` paths select alternative
+  breakdown files.
 
 All three programs use only the Python standard library. The external work is
 performed by the checkout's `sglang`/Python executables and the `nsys` command,
@@ -375,8 +446,9 @@ For each variant, the output directory contains:
 - `<variant>_full_breakdown.json`: TTFT, TPOT, and E2E decompositions;
 - server, client, export, and analyzer logs;
 - `manifest.json`: model, parallelism, and workload parameters;
-- `comparison.json`: raw component differences, signed data-dependent
-  observations, and overhead checks when both variants and clean runs exist.
+- `comparison.json`: launch-stall corrected and raw component differences,
+  the separated stall per variant, signed data-dependent observations, capture
+  quality, and overhead checks when both variants and clean runs exist.
 
 Concurrent request-window attribution requires the client and profiled server
 to share the same monotonic system clock. `run_suite.py` satisfies this by

@@ -23,8 +23,28 @@ The public model has three additive buckets:
 
 Small cross-stream timestamp overlap is assigned to compute, while raw
 communication-kernel activity and overlap remain available in diagnostics.
-This guarantees ``total = compute + communication + uncovered`` at every
-aggregation level without claiming that uncovered time is communication.
+
+A fourth additive bucket, ``launch_stall``, isolates GPU idle time before a
+rank's first collective and the peer waiting it causes. Under Nsight node-level
+CUDA-graph tracing every host graph launch costs milliseconds, and a rank whose
+launch returns late idles before its first graph node while every other rank
+spins inside the first collective waiting for it. Per step and rank ``r``, let
+``s_r`` be the start of its first communication kernel and ``g_r`` its
+host-late idle before ``s_r``: GPU-idle time, measured from the earliest step
+start across ranks, in which the launch call of the next kernel had not yet
+returned. ``A = max s_r`` is the latest arrival and ``A* = max (s_r - g_r)``
+the latest arrival with host-late idle removed. On the selected rank, its
+host-late idle inside its own span moves from uncovered to ``launch_stall``
+and communication-kernel time inside ``[s_r, A]``, capped at ``(A - A*) -
+g_r``, moves from communication to ``launch_stall``. The bucket is bounded by
+the largest host-late idle of any rank in the step and is zero when every
+kernel before the first collective had been launched before the GPU reached
+it, so GPU-side launch latency and a wait for a rank that was busy computing
+stay classified as before.
+
+This guarantees ``total = compute + communication + uncovered + launch_stall``
+at every aggregation level, and ``total_excluding_launch_stall`` is the model
+time with the profiler-induced launch wait removed.
 """
 
 from __future__ import annotations
@@ -37,7 +57,7 @@ import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 MEASUREMENT_MARKER_PREFIX = "sglang.measurement:"
 BATCH_PHASE_MARKER_PREFIX = "sglang.batch_phase:"
@@ -80,6 +100,14 @@ DEFAULT_COMMUNICATION_COMPUTE_OVERLAP_TOLERANCE_NS = 25_000
 SchedulerRange = tuple[int, int, int, str]
 
 
+BUCKETS = ("compute", "communication", "uncovered", "launch_stall")
+MODEL_BUCKETS = ("compute", "communication", "uncovered")
+STALL_PARTS = ("launch_stall_from_communication", "launch_stall_from_uncovered")
+SUMMED_COMPONENT_FIELDS = (*BUCKETS, *STALL_PARTS)
+Interval = tuple[int, int]
+Intervals = tuple[Interval, ...]
+
+
 @dataclass
 class RankStep:
     device: int
@@ -95,9 +123,57 @@ class RankStep:
     kernel_count: int
     graph_kernel_count: int
     stream_count: int
-    compute_intervals: tuple[tuple[int, int], ...]
-    communication_intervals: tuple[tuple[int, int], ...]
+    compute_intervals: Intervals
+    communication_intervals: Intervals
     phase: str
+    # Communication with tolerated compute overlap removed; merged kernel coverage.
+    exclusive_communication_intervals: Intervals = ()
+    coverage_intervals: Intervals = ()
+    first_communication_start: int | None = None
+    first_communication_end: int | None = None
+    # Idle before the first collective during which the next kernel's launch
+    # call had not returned, and when the step's first kernel launch returned.
+    host_late_head_idle_intervals: Intervals = ()
+    first_kernel_launch_end: int | None = None
+    # Set by annotate_launch_stall once every rank of the step is known.
+    launch_stall_communication_intervals: Intervals = ()
+    launch_stall_idle_intervals: Intervals = ()
+    launch_stall_from_communication: int = 0
+    launch_stall_from_uncovered: int = 0
+
+    @property
+    def launch_stall(self) -> int:
+        return self.launch_stall_from_communication + self.launch_stall_from_uncovered
+
+    @property
+    def communication_corrected(self) -> int:
+        return self.communication - self.launch_stall_from_communication
+
+    @property
+    def uncovered_corrected(self) -> int:
+        return self.uncovered - self.launch_stall_from_uncovered
+
+    @property
+    def total_excluding_launch_stall(self) -> int:
+        return self.total - self.launch_stall
+
+
+class LaunchStallAudit(NamedTuple):
+    """Per-step arrival skew at the first collective across every rank."""
+
+    earliest_first_communication_start: int
+    latest_first_communication_start: int
+    late_device: int
+    # How much removing every rank's head idle would move the latest arrival.
+    latest_arrival_shift: int
+    max_head_idle: int
+
+    @property
+    def arrival_skew(self) -> int:
+        return (
+            self.latest_first_communication_start
+            - self.earliest_first_communication_start
+        )
 
 
 @dataclass
@@ -106,6 +182,7 @@ class CriticalStep:
     phase: str
     rank: RankStep
     all_rank_longest: RankStep
+    launch_stall_audit: LaunchStallAudit | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +206,7 @@ class StepGroup:
     phase: str
     ranks: dict[int, RankStep]
     all_rank_longest: RankStep
+    launch_stall_audit: LaunchStallAudit | None = None
 
 
 def merge_intervals(
@@ -182,6 +260,144 @@ def interval_intersection_segments(
         else:
             second_index += 1
     return tuple(intersections)
+
+
+def interval_difference_segments(
+    first: Iterable[tuple[int, int]], second: Iterable[tuple[int, int]]
+) -> tuple[tuple[int, int], ...]:
+    """Return disjoint intervals active in ``first`` but not in ``second``."""
+
+    remaining = list(merge_intervals(first))
+    blockers = merge_intervals(second)
+    result: list[tuple[int, int]] = []
+    blocker_index = 0
+    for left, right in remaining:
+        cursor = left
+        while blocker_index < len(blockers) and blockers[blocker_index][1] <= cursor:
+            blocker_index += 1
+        scan = blocker_index
+        while scan < len(blockers) and blockers[scan][0] < right:
+            block_left, block_right = blockers[scan]
+            if block_left > cursor:
+                result.append((cursor, block_left))
+            cursor = max(cursor, block_right)
+            if cursor >= right:
+                break
+            scan += 1
+        if cursor < right:
+            result.append((cursor, right))
+    return tuple(result)
+
+
+def take_intervals_from_end(
+    intervals: Iterable[tuple[int, int]], budget: int
+) -> tuple[tuple[int, int], ...]:
+    """Return the latest ``budget`` nanoseconds of an interval union."""
+
+    if budget <= 0:
+        return ()
+    taken: list[tuple[int, int]] = []
+    remaining = budget
+    for left, right in reversed(merge_intervals(intervals)):
+        length = right - left
+        if length >= remaining:
+            taken.append((right - remaining, right))
+            remaining = 0
+            break
+        taken.append((left, right))
+        remaining -= length
+    return tuple(reversed(taken))
+
+
+def host_late_idle_before(
+    coverage_intervals: Intervals, launch_end_by_start: dict[int, int], limit: int
+) -> Intervals:
+    """Return idle gaps before ``limit`` whose next kernel was launched after the gap began."""
+
+    result: list[tuple[int, int]] = []
+    previous_end: int | None = None
+    for left, right in coverage_intervals:
+        if left >= limit:
+            break
+        if previous_end is not None and left > previous_end:
+            if launch_end_by_start.get(left, 0) > previous_end:
+                result.append((previous_end, left))
+        previous_end = right if previous_end is None else max(previous_end, right)
+    return tuple(result)
+
+
+def annotate_launch_stall(group: StepGroup) -> None:
+    """Move head idle and the peer waiting it causes into launch_stall."""
+
+    for rank in group.ranks.values():
+        rank.launch_stall_communication_intervals = ()
+        rank.launch_stall_idle_intervals = ()
+        rank.launch_stall_from_communication = 0
+        rank.launch_stall_from_uncovered = 0
+    ranks = [
+        rank
+        for rank in group.ranks.values()
+        if rank.first_communication_start is not None
+    ]
+    if len(ranks) < 2:
+        group.launch_stall_audit = None
+        return
+    # A late preamble idles before the rank's own span; it counts toward the
+    # arrival delay when the step's first kernel launch returned after the
+    # earliest rank had already started the step.
+    earliest_start = min(rank.start for rank in ranks)
+    head_idle_intervals: dict[int, Intervals] = {}
+    head_idle: dict[int, int] = {}
+    for rank in ranks:
+        pre_span = 0
+        if (
+            rank.first_kernel_launch_end is not None
+            and rank.first_kernel_launch_end > earliest_start
+        ):
+            pre_span = max(0, rank.start - earliest_start)
+        head_idle_intervals[rank.device] = rank.host_late_head_idle_intervals
+        head_idle[rank.device] = pre_span + interval_union_length(
+            rank.host_late_head_idle_intervals
+        )
+    earliest = min(rank.first_communication_start for rank in ranks)
+    late = max(ranks, key=lambda rank: rank.first_communication_start)
+    latest = late.first_communication_start
+    counterfactual_latest = max(
+        rank.first_communication_start - head_idle[rank.device] for rank in ranks
+    )
+    shift = latest - counterfactual_latest
+    group.launch_stall_audit = LaunchStallAudit(
+        earliest_first_communication_start=earliest,
+        latest_first_communication_start=latest,
+        late_device=late.device,
+        latest_arrival_shift=shift,
+        max_head_idle=max(head_idle.values()),
+    )
+    for rank in ranks:
+        rank.launch_stall_idle_intervals = head_idle_intervals[rank.device]
+        rank.launch_stall_from_uncovered = interval_union_length(
+            rank.launch_stall_idle_intervals
+        )
+        budget = shift - head_idle[rank.device]
+        if budget > 0:
+            waiting = interval_intersection_segments(
+                rank.exclusive_communication_intervals,
+                ((rank.first_communication_start, latest),),
+            )
+            rank.launch_stall_communication_intervals = take_intervals_from_end(
+                waiting, budget
+            )
+            rank.launch_stall_from_communication = interval_union_length(
+                rank.launch_stall_communication_intervals
+            )
+        if (
+            rank.launch_stall_from_uncovered > rank.uncovered
+            or rank.launch_stall_from_communication > rank.communication
+        ):
+            raise AssertionError(
+                "Launch-stall reclassification exceeded its source bucket on "
+                f"device {rank.device} step [{rank.start}, {rank.end}]"
+            )
 
 
 def validate_communication_compute_overlap(
@@ -568,7 +784,8 @@ def load_rank_step(
             kernels.end,
             strings.value,
             kernels.graphId,
-            kernels.streamId
+            kernels.streamId,
+            kernels.correlationId
         FROM CUPTI_ACTIVITY_KIND_KERNEL AS kernels
         JOIN StringIds AS strings ON strings.id = kernels.shortName
         WHERE kernels.deviceId = ?
@@ -582,6 +799,21 @@ def load_rank_step(
         """,
         (device, global_tid, range_start, range_end),
     ).fetchall()
+    # Joining this into the kernel query makes SQLite drop the correlation
+    # index; a separate indexed lookup of the launch return times is free.
+    launch_end_by_correlation = dict(
+        connection.execute(
+            """
+            SELECT runtime.correlationId, max(runtime.end)
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME AS runtime
+            WHERE runtime.globalTid = ?
+              AND runtime.start >= ?
+              AND runtime.start <= ?
+            GROUP BY runtime.correlationId
+            """,
+            (global_tid, range_start, range_end),
+        ).fetchall()
+    )
     if not rows:
         raise ValueError(
             f"No CUDA kernels mapped to device {device} scheduler range "
@@ -593,9 +825,12 @@ def load_rank_step(
     communication_intervals_raw: list[tuple[int, int]] = []
     graph_kernel_count = 0
     streams: set[int] = set()
-    for start, end, name, graph_id, stream_id in rows:
+    launch_end_by_start: dict[int, int] = {}
+    for start, end, name, graph_id, stream_id, correlation_id in rows:
         interval = (start, end)
         all_intervals.append(interval)
+        launch_end = launch_end_by_correlation[correlation_id]
+        launch_end_by_start[start] = max(launch_end_by_start.get(start, 0), launch_end)
         streams.add(stream_id)
         if graph_id is not None:
             graph_kernel_count += 1
@@ -636,6 +871,18 @@ def load_rank_step(
         )
     if total != compute + communication + uncovered:
         raise AssertionError("Internal three-bucket arithmetic invariant failed")
+    exclusive_communication_intervals = interval_difference_segments(
+        communication_intervals, compute_intervals
+    )
+    first_communication = (
+        min(communication_intervals_raw) if communication_intervals_raw else None
+    )
+    coverage_intervals = merge_intervals(all_intervals)
+    host_late_head_idle = host_late_idle_before(
+        coverage_intervals,
+        launch_end_by_start,
+        first_communication[0] if first_communication else start,
+    )
     return RankStep(
         device=device,
         start=start,
@@ -653,6 +900,16 @@ def load_rank_step(
         compute_intervals=compute_intervals,
         communication_intervals=communication_intervals,
         phase=phase,
+        exclusive_communication_intervals=exclusive_communication_intervals,
+        coverage_intervals=coverage_intervals,
+        first_communication_start=(
+            first_communication[0] if first_communication else None
+        ),
+        first_communication_end=(
+            first_communication[1] if first_communication else None
+        ),
+        host_late_head_idle_intervals=host_late_head_idle,
+        first_kernel_launch_end=launch_end_by_start[start],
     )
 
 
@@ -665,14 +922,14 @@ def build_step_groups(rank_steps: dict[int, list[RankStep]]) -> list[StepGroup]:
         if not active_phases:
             raise ValueError(f"Scheduler step {index} is idle on every rank")
         phase = next(iter(active_phases)) if len(active_phases) == 1 else "mixed"
-        step_groups.append(
-            StepGroup(
-                index=index,
-                phase=phase,
-                ranks={step.device: step for step in candidates},
-                all_rank_longest=max(candidates, key=lambda step: step.total),
-            )
+        group = StepGroup(
+            index=index,
+            phase=phase,
+            ranks={step.device: step for step in candidates},
+            all_rank_longest=max(candidates, key=lambda step: step.total),
         )
+        annotate_launch_stall(group)
+        step_groups.append(group)
     return step_groups
 
 
@@ -781,6 +1038,7 @@ def select_critical_step(
         phase=phase,
         rank=max(candidates, key=lambda step: step.total),
         all_rank_longest=group.all_rank_longest,
+        launch_stall_audit=group.launch_stall_audit,
     )
 
 
@@ -837,49 +1095,114 @@ def split_requests(
     return requests
 
 
+def build_components(values: dict[str, float]) -> dict[str, float]:
+    """Attach both additive totals to per-bucket millisecond values."""
+
+    result = dict(values)
+    # launch_stall and both totals are derived here, never scaled or summed
+    # on their own, so the split and additive checks stay exact.
+    result["launch_stall"] = sum(values[part] for part in STALL_PARTS)
+    result["total"] = sum(result[bucket] for bucket in BUCKETS)
+    result["total_excluding_launch_stall"] = sum(
+        result[bucket] for bucket in MODEL_BUCKETS
+    )
+    return result
+
+
+def check_components(values: dict[str, float], context: str) -> None:
+    if values["total"] != sum(values[bucket] for bucket in BUCKETS):
+        raise AssertionError(
+            f"{context} violates total = compute + communication + uncovered "
+            "+ launch_stall"
+        )
+    if values["total_excluding_launch_stall"] != sum(
+        values[bucket] for bucket in MODEL_BUCKETS
+    ):
+        raise AssertionError(
+            f"{context} violates total_excluding_launch_stall = compute + "
+            "communication + uncovered"
+        )
+    if values["launch_stall"] != sum(values[part] for part in STALL_PARTS):
+        raise AssertionError(f"{context} violates the launch_stall split")
+
+
+def add_components(
+    first: dict[str, float], second: dict[str, float]
+) -> dict[str, float]:
+    summed = {
+        key: first[key] + second[key]
+        for key in first
+        if key not in ("total", "total_excluding_launch_stall", "launch_stall")
+    }
+    return build_components(summed)
+
+
+def scale_components(values: dict[str, float], divisor: float) -> dict[str, float]:
+    scaled = {
+        key: value / divisor
+        for key, value in values.items()
+        if key not in ("total", "total_excluding_launch_stall", "launch_stall")
+    }
+    return build_components(scaled)
+
+
 def component_totals(steps: Iterable[CriticalStep]) -> dict[str, float]:
     steps = list(steps)
     total_ns = sum(step.rank.total for step in steps)
     compute_ns = sum(step.rank.compute for step in steps)
-    communication_ns = sum(step.rank.communication for step in steps)
-    uncovered_ns = sum(step.rank.uncovered for step in steps)
-    if total_ns != compute_ns + communication_ns + uncovered_ns:
+    communication_ns = sum(step.rank.communication_corrected for step in steps)
+    uncovered_ns = sum(step.rank.uncovered_corrected for step in steps)
+    stall_communication_ns = sum(
+        step.rank.launch_stall_from_communication for step in steps
+    )
+    stall_uncovered_ns = sum(step.rank.launch_stall_from_uncovered for step in steps)
+    if total_ns != (
+        compute_ns
+        + communication_ns
+        + uncovered_ns
+        + stall_communication_ns
+        + stall_uncovered_ns
+    ):
         raise AssertionError(
-            "Request components violate total = compute + communication + uncovered"
+            "Request components violate total = compute + communication + "
+            "uncovered + launch_stall"
         )
 
     ns_to_ms = 1e-6
-    compute_ms = compute_ns * ns_to_ms
-    communication_ms = communication_ns * ns_to_ms
-    uncovered_ms = uncovered_ns * ns_to_ms
-    result = {
-        # Build total from the converted buckets as well, so serialized
-        # request values retain the additive invariant bit-for-bit.
-        "total": sum((compute_ms, communication_ms, uncovered_ms)),
-        "compute": compute_ms,
-        "communication": communication_ms,
-        "uncovered": uncovered_ms,
-    }
-    return result
+    stall_communication_ms = stall_communication_ns * ns_to_ms
+    stall_uncovered_ms = stall_uncovered_ns * ns_to_ms
+    return build_components(
+        {
+            "compute": compute_ns * ns_to_ms,
+            "communication": communication_ns * ns_to_ms,
+            "uncovered": uncovered_ns * ns_to_ms,
+            "launch_stall": sum((stall_communication_ms, stall_uncovered_ms)),
+            "launch_stall_from_communication": stall_communication_ms,
+            "launch_stall_from_uncovered": stall_uncovered_ms,
+        }
+    )
 
 
 def summarize_metric(request_values: list[dict[str, float]]) -> dict:
-    buckets = ("compute", "communication", "uncovered")
-    components = ("total", *buckets)
+    components = ("total", "total_excluding_launch_stall", *SUMMED_COMPONENT_FIELDS)
     result = {
         component: summarize([request[component] for request in request_values])
         for component in components
     }
-    result["total"]["mean"] = sum(result[bucket]["mean"] for bucket in buckets)
+    result["total"]["mean"] = sum(result[bucket]["mean"] for bucket in BUCKETS)
+    result["total_excluding_launch_stall"]["mean"] = sum(
+        result[bucket]["mean"] for bucket in MODEL_BUCKETS
+    )
     mean_total = result["total"]["mean"]
+    mean_model_total = result["total_excluding_launch_stall"]["mean"]
     result["mean_fraction"] = {
-        bucket: result[bucket]["mean"] / mean_total for bucket in buckets
+        bucket: result[bucket]["mean"] / mean_total for bucket in BUCKETS
+    }
+    result["mean_fraction_excluding_launch_stall"] = {
+        bucket: result[bucket]["mean"] / mean_model_total for bucket in MODEL_BUCKETS
     }
     for values in request_values:
-        if values["total"] != sum(values[bucket] for bucket in buckets):
-            raise AssertionError(
-                "Summary input violates total = compute + communication + uncovered"
-            )
+        check_components(values, "Summary input")
     return result
 
 
@@ -928,6 +1251,8 @@ def request_window_components(
     model_intervals: list[tuple[int, int]] = []
     compute_intervals: list[tuple[int, int]] = []
     communication_intervals: list[tuple[int, int]] = []
+    stall_communication_intervals: list[tuple[int, int]] = []
+    stall_idle_intervals: list[tuple[int, int]] = []
     for step in critical_steps:
         rank = step.rank
         if rank.start >= window_end or rank.end <= window_start:
@@ -941,20 +1266,45 @@ def request_window_components(
         communication_intervals.extend(
             clip_intervals(rank.communication_intervals, window_start, window_end)
         )
+        stall_communication_intervals.extend(
+            clip_intervals(
+                rank.launch_stall_communication_intervals, window_start, window_end
+            )
+        )
+        stall_idle_intervals.extend(
+            clip_intervals(rank.launch_stall_idle_intervals, window_start, window_end)
+        )
 
     total = interval_union_length(model_intervals)
     merged_compute_intervals = merge_intervals(compute_intervals)
     merged_communication_intervals = merge_intervals(communication_intervals)
     compute = interval_union_length(merged_compute_intervals)
     communication_active = interval_union_length(merged_communication_intervals)
-    kernel_coverage = interval_union_length(
+    merged_coverage_intervals = merge_intervals(
         (*merged_compute_intervals, *merged_communication_intervals)
     )
+    kernel_coverage = interval_union_length(merged_coverage_intervals)
     communication_compute_overlap_segments = interval_intersection_segments(
         merged_communication_intervals, merged_compute_intervals
     )
     communication_compute_overlap = sum(
         right - left for left, right in communication_compute_overlap_segments
+    )
+    # A step's stall intervals can touch a neighbouring step's kernels on another
+    # device; keep each inside the window bucket it is taken from.
+    stall_communication = interval_union_length(
+        interval_difference_segments(
+            interval_intersection_segments(
+                stall_communication_intervals, merged_communication_intervals
+            ),
+            merged_compute_intervals,
+        )
+    )
+    stall_uncovered = interval_union_length(
+        interval_difference_segments(
+            interval_intersection_segments(stall_idle_intervals, model_intervals),
+            merged_coverage_intervals,
+        )
     )
     window = window_end - window_start
     if compute > total or kernel_coverage > total:
@@ -962,18 +1312,21 @@ def request_window_components(
             "Kernel interval union exceeds model span in request window: "
             f"compute={compute}, coverage={kernel_coverage}, total={total}"
         )
-    communication = communication_active - communication_compute_overlap
-    uncovered = total - kernel_coverage
+    communication = (
+        communication_active - communication_compute_overlap - stall_communication
+    )
+    uncovered = total - kernel_coverage - stall_uncovered
+    launch_stall = stall_communication + stall_uncovered
     if communication < 0 or uncovered < 0:
         raise AssertionError(
             "Request-window kernel accounting produced a negative bucket"
         )
-    if total != sum((compute, communication, uncovered)):
+    if total != sum((compute, communication, uncovered, launch_stall)):
         raise AssertionError(
             "Request window violates total = compute + communication + uncovered "
-            "in integer nanoseconds: "
+            "+ launch_stall in integer nanoseconds: "
             f"total={total}, compute={compute}, communication={communication}, "
-            f"uncovered={uncovered}"
+            f"uncovered={uncovered}, launch_stall={launch_stall}"
         )
     validate_communication_compute_overlap(
         max(
@@ -985,22 +1338,23 @@ def request_window_components(
     )
 
     ns_to_ms = 1e-6
-    compute_ms = compute * ns_to_ms
-    communication_ms = communication * ns_to_ms
-    uncovered_ms = uncovered * ns_to_ms
-    result = {
-        # Use the same summation operation as the serialized invariant check.
-        # Python 3.12's compensated sum can differ by one final bit from a
-        # left-associated ``a + b + c`` expression.
-        "total": sum((compute_ms, communication_ms, uncovered_ms)),
-        "compute": compute_ms,
-        "communication": communication_ms,
-        "uncovered": uncovered_ms,
-        "communication_compute_overlap": communication_compute_overlap * ns_to_ms,
-        "outside_model": (window - total) * ns_to_ms,
-        "client_window": window * ns_to_ms,
-    }
-    return result
+    stall_communication_ms = stall_communication * ns_to_ms
+    stall_uncovered_ms = stall_uncovered * ns_to_ms
+    # build_components sums with the same operation as the invariant check;
+    # Python 3.12's compensated sum can differ by one bit from a + b + c.
+    return build_components(
+        {
+            "compute": compute * ns_to_ms,
+            "communication": communication * ns_to_ms,
+            "uncovered": uncovered * ns_to_ms,
+            "launch_stall": sum((stall_communication_ms, stall_uncovered_ms)),
+            "launch_stall_from_communication": stall_communication_ms,
+            "launch_stall_from_uncovered": stall_uncovered_ms,
+            "communication_compute_overlap": communication_compute_overlap * ns_to_ms,
+            "outside_model": (window - total) * ns_to_ms,
+            "client_window": window * ns_to_ms,
+        }
+    )
 
 
 def analyze_request_windows(
@@ -1087,16 +1441,7 @@ def analyze_request_windows(
             context=f"{request_context} E2E window",
         )
         inter_token_count = output_len - 1
-        tpot_buckets = {
-            bucket: decode[bucket] / inter_token_count
-            for bucket in ("compute", "communication", "uncovered")
-        }
-        tpot = {
-            "total": sum(tpot_buckets.values()),
-            **tpot_buckets,
-            "outside_model": decode["outside_model"] / inter_token_count,
-            "client_window": decode["client_window"] / inter_token_count,
-        }
+        tpot = scale_components(decode, inter_token_count)
 
         ttft_values.append(ttft)
         tpot_values.append(tpot)
@@ -1325,23 +1670,9 @@ def main() -> None:
                 decode_steps = traced_decode_steps
             ttft = component_totals(prefill_steps)
             decode = component_totals(decode_steps)
-            e2e_buckets = {
-                bucket: ttft[bucket] + decode[bucket]
-                for bucket in ("compute", "communication", "uncovered")
-            }
-            e2e = {
-                "total": sum(e2e_buckets.values()),
-                **e2e_buckets,
-            }
+            e2e = add_components(ttft, decode)
             decode_count = len(decode_steps)
-            tpot_buckets = {
-                bucket: decode[bucket] / decode_count
-                for bucket in ("compute", "communication", "uncovered")
-            }
-            tpot = {
-                "total": sum(tpot_buckets.values()),
-                **tpot_buckets,
-            }
+            tpot = scale_components(decode, decode_count)
             ttft_values.append(ttft)
             tpot_values.append(tpot)
             e2e_values.append(e2e)
@@ -1409,6 +1740,7 @@ def main() -> None:
             model_values = []
             residual_values = []
             coverage_values = []
+            corrected_values = []
             for detail in request_details:
                 effective_divisor = (
                     detail["output_len"] - 1 if divisor is None else divisor
@@ -1418,11 +1750,15 @@ def main() -> None:
                 residual = detail[trace_key]["outside_model"]
                 client_values.append(client_value)
                 model_values.append(trace_value)
+                corrected_values.append(
+                    detail[trace_key]["total_excluding_launch_stall"]
+                )
                 residual_values.append(residual)
                 coverage_values.append(trace_value / client_value)
             request_window_validation[metric] = {
                 "client_ms": summarize(client_values),
                 "trace_model_ms": summarize(model_values),
+                "trace_model_excluding_launch_stall_ms": summarize(corrected_values),
                 "outside_model_ms": summarize(residual_values),
                 "model_coverage_fraction": summarize(coverage_values),
             }
@@ -1437,6 +1773,50 @@ def main() -> None:
         )
         for dp_rank in available_dp_ranks
     }
+    launch_stall_by_phase: dict[str, dict] = {}
+    for phase in sorted({step.phase for step in selected_critical_steps}):
+        phase_steps = [step for step in selected_critical_steps if step.phase == phase]
+        stall_values = [step.rank.launch_stall * ns_to_ms for step in phase_steps]
+        skew_values = [
+            step.launch_stall_audit.arrival_skew * ns_to_ms
+            for step in phase_steps
+            if step.launch_stall_audit is not None
+        ]
+        shift_values = [
+            step.launch_stall_audit.latest_arrival_shift * ns_to_ms
+            for step in phase_steps
+            if step.launch_stall_audit is not None
+        ]
+        head_idle_values = [
+            step.launch_stall_audit.max_head_idle * ns_to_ms
+            for step in phase_steps
+            if step.launch_stall_audit is not None
+        ]
+        launch_stall_by_phase[phase] = {
+            "step_count": len(phase_steps),
+            "launch_stall_ms": summarize(stall_values),
+            "launch_stall_total_ms": sum(stall_values),
+            "steps_with_launch_stall": sum(value > 0 for value in stall_values),
+            "first_collective_arrival_skew_ms": (
+                summarize(skew_values) if skew_values else None
+            ),
+            "latest_arrival_shift_ms": (
+                summarize(shift_values) if shift_values else None
+            ),
+            "max_head_idle_ms": (
+                summarize(head_idle_values) if head_idle_values else None
+            ),
+            "late_device_counts": dict(
+                sorted(
+                    collections.Counter(
+                        step.launch_stall_audit.late_device
+                        for step in phase_steps
+                        if step.launch_stall_audit is not None
+                        and step.rank.launch_stall > 0
+                    ).items()
+                )
+            ),
+        }
     step_selection_audit = [
         {
             "index": group.index,
@@ -1472,7 +1852,25 @@ def main() -> None:
                 "selected-rank first-to-last-kernel span with no classified "
                 "GPU kernel active; includes host launch and synchronization gaps"
             ),
-            "additive_invariant": "total = compute + communication + uncovered",
+            "launch_stall": (
+                "per step and rank, g is the host-late idle before the rank's "
+                "first communication kernel: GPU-idle time, measured from the "
+                "earliest step start, in which the next kernel's launch call "
+                "had not yet returned; A is the latest first-communication "
+                "start across ranks and A* the latest start with g removed; "
+                "on the selected rank, its host-late idle inside its span "
+                "moves from uncovered to launch_stall and communication-kernel "
+                "time before A, capped at (A - A*) - g, moves from "
+                "communication to launch_stall; bounded by the largest g in "
+                "the step and zero when every kernel before the first "
+                "collective was launched before the GPU reached it"
+            ),
+            "additive_invariant": (
+                "total = compute + communication + uncovered + launch_stall"
+            ),
+            "model_invariant": (
+                "total_excluding_launch_stall = compute + communication + uncovered"
+            ),
             "phase_source": "explicit scheduler batch-phase NVTX markers",
             "request_window_semantics": (
                 "GPU critical-path time experienced while each request is "
@@ -1570,8 +1968,13 @@ def main() -> None:
                     step.rank.uncovered for step in selected_critical_steps
                 )
                 * ns_to_ms,
+                "launch_stall": sum(
+                    step.rank.launch_stall for step in selected_critical_steps
+                )
+                * ns_to_ms,
             },
             "step_selection_audit": step_selection_audit,
+            "launch_stall_by_phase": launch_stall_by_phase,
         },
         "critical_steps": [
             {
@@ -1585,13 +1988,50 @@ def main() -> None:
                 "total_ms": sum(
                     (
                         step.rank.compute * ns_to_ms,
-                        step.rank.communication * ns_to_ms,
-                        step.rank.uncovered * ns_to_ms,
+                        step.rank.communication_corrected * ns_to_ms,
+                        step.rank.uncovered_corrected * ns_to_ms,
+                        step.rank.launch_stall * ns_to_ms,
+                    )
+                ),
+                "total_excluding_launch_stall_ms": sum(
+                    (
+                        step.rank.compute * ns_to_ms,
+                        step.rank.communication_corrected * ns_to_ms,
+                        step.rank.uncovered_corrected * ns_to_ms,
                     )
                 ),
                 "compute_ms": step.rank.compute * ns_to_ms,
-                "communication_ms": step.rank.communication * ns_to_ms,
-                "uncovered_ms": step.rank.uncovered * ns_to_ms,
+                "communication_ms": step.rank.communication_corrected * ns_to_ms,
+                "uncovered_ms": step.rank.uncovered_corrected * ns_to_ms,
+                "launch_stall_ms": step.rank.launch_stall * ns_to_ms,
+                "launch_stall_from_communication_ms": (
+                    step.rank.launch_stall_from_communication * ns_to_ms
+                ),
+                "launch_stall_from_uncovered_ms": (
+                    step.rank.launch_stall_from_uncovered * ns_to_ms
+                ),
+                "communication_raw_ms": step.rank.communication * ns_to_ms,
+                "uncovered_raw_ms": step.rank.uncovered * ns_to_ms,
+                "first_collective_arrival_skew_ms": (
+                    step.launch_stall_audit.arrival_skew * ns_to_ms
+                    if step.launch_stall_audit is not None
+                    else None
+                ),
+                "late_device": (
+                    step.launch_stall_audit.late_device
+                    if step.launch_stall_audit is not None
+                    else None
+                ),
+                "latest_arrival_shift_ms": (
+                    step.launch_stall_audit.latest_arrival_shift * ns_to_ms
+                    if step.launch_stall_audit is not None
+                    else None
+                ),
+                "max_head_idle_ms": (
+                    step.launch_stall_audit.max_head_idle * ns_to_ms
+                    if step.launch_stall_audit is not None
+                    else None
+                ),
                 "communication_kernel_active_ms": (
                     step.rank.communication_kernel_active * ns_to_ms
                 ),
