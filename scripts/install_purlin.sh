@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly PURLIN_VERSION="0.6.0"
+readonly PURLIN_VERSION="0.6.5"
 readonly ACCELERATE_VERSION="1.12.0"
 readonly DATASETS_VERSION="5.0.1"
 readonly FSSPEC_VERSION="2026.6.0"
