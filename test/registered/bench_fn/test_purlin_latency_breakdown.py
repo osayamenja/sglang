@@ -427,6 +427,197 @@ class TestTraceBoundaries(unittest.TestCase):
             )
 
 
+class TestSlurmBreakdown(unittest.TestCase):
+    def test_launcher_and_per_node_profile_command(self):
+        import slurm_server
+
+        argv = [
+            "suite",
+            "--model",
+            "test",
+            "--tp",
+            "16",
+            "--nnodes",
+            "2",
+            "--dist-init-addr",
+            "node0:20000",
+            "--output-dir",
+            "test",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = suite.parse_args()
+        self.assertEqual(args.variants, ("baseline",))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stop = root / "stop"
+            stop.touch()
+            command = suite.slurm_server_command(
+                args, ["sglang", "serve"], stop, root / "profile"
+            )
+            self.assertEqual(command[0], "srun")
+            self.assertIn("--ntasks-per-node=1", command)
+            worker_argv = command[
+                command.index(str(BENCHMARK_DIR / "slurm_server.py")) :
+            ]
+            with (
+                patch.object(sys, "argv", worker_argv),
+                patch.dict(suite.os.environ, SLURM_NODEID="1"),
+                patch.object(slurm_server.subprocess, "Popen") as popen,
+                patch.object(slurm_server, "stop_process_group"),
+            ):
+                slurm_server.main()
+            remote = popen.call_args.args[0]
+            self.assertEqual(remote[:2], ["nsys", "profile"])
+            self.assertIn(f"--output={root}/profile_node1", remote)
+            self.assertEqual(
+                remote[-8:],
+                [
+                    "sglang",
+                    "serve",
+                    "--nnodes",
+                    "2",
+                    "--dist-init-addr",
+                    "node0:20000",
+                    "--node-rank",
+                    "1",
+                ],
+            )
+            self.assertIn("TRITON_CACHE_DIR", popen.call_args.kwargs["env"])
+
+    @staticmethod
+    def write_trace(path, rank, epoch):
+        # Both nodes report CUDA device 0 and scheduler PID 1. All timestamps
+        # describe the same physical steps but have different session origins.
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE TARGET_INFO_SESSION_START_TIME (systemClockNs, utcEpochNs);
+                CREATE TABLE TARGET_INFO_CUDA_CONTEXT_INFO (processId, deviceId, isGreenContext);
+                CREATE TABLE NVTX_EVENTS (start, end, globalTid, textId, text);
+                CREATE TABLE StringIds (id, value);
+                CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (deviceId, start, end, shortName, graphId, streamId, correlationId);
+                CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (globalTid, start, end, correlationId);
+                INSERT INTO StringIds VALUES (1, 'compute');
+                INSERT INTO TARGET_INFO_CUDA_CONTEXT_INFO VALUES (1, 0, 0);
+            """)
+            tid = 1 << 24
+            db.execute(
+                "INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES (?,?)",
+                (50000 + rank * 60000, epoch),
+            )
+            for phase, offset in [("begin", 0), ("end", 200)]:
+                payload = dict(
+                    run_id="same",
+                    phase=phase,
+                    pp_rank=0,
+                    dp_rank=0,
+                    attn_dp_rank=0,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    moe_ep_rank=rank,
+                    gpu_id=0,
+                )
+                db.execute(
+                    "INSERT INTO NVTX_EVENTS VALUES (?,NULL,?,NULL,?)",
+                    (
+                        1000 - epoch + offset,
+                        tid,
+                        trace.MEASUREMENT_MARKER_PREFIX + json.dumps(payload),
+                    ),
+                )
+            for index, phase in enumerate(("prefill", "decode")):
+                start = 1010 - epoch + index * 100
+                db.execute(
+                    "INSERT INTO NVTX_EVENTS VALUES (?,?,?,NULL,'scheduler.run_batch')",
+                    (start, start + 3, tid),
+                )
+                db.execute(
+                    "INSERT INTO NVTX_EVENTS VALUES (?,NULL,?,NULL,?)",
+                    (start + 1, tid, trace.BATCH_PHASE_MARKER_PREFIX + phase),
+                )
+                db.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?,?,?,?)",
+                    (tid, start, start + 2, index),
+                )
+                db.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (0,?,?,1,NULL,1,?)",
+                    (start + 2, start + 12 + rank * 20, index),
+                )
+
+    def test_combines_host_clocks_before_critical_rank_and_client_attribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary, peer = root / "a.sqlite", root / "b.sqlite"
+            self.write_trace(primary, 0, 100)
+            self.write_trace(peer, 1, 350)
+            client = root / "client.jsonl"
+            out = root / "breakdown.json"
+            argv = [
+                "analyze",
+                str(primary),
+                str(client),
+                "--peer-sqlite",
+                str(peer),
+                "--expected-tp",
+                "2",
+                "--label",
+                "baseline",
+                "--output",
+                str(out),
+                "--quiet",
+            ]
+            for concurrency in (1, 16):
+                # The client uses node zero's monotonic clock, in seconds.
+                client.write_text(
+                    json.dumps(
+                        dict(
+                            run_id="same",
+                            concurrency=concurrency,
+                            input_lens=[8192],
+                            output_lens=[2],
+                            dp_ranks=[0],
+                            errors=[],
+                            ttfts=[1e-7],
+                            itls=[[1e-7]],
+                            send_times=[50900e-9],
+                            finish_times=[51100e-9],
+                            mean_ttft_ms=1e-4,
+                            mean_tpot_ms=1e-4,
+                            mean_e2e_latency_ms=2e-4,
+                        )
+                    )
+                    + "\n"
+                )
+                with patch.object(sys, "argv", argv):
+                    trace.main()
+                result = json.loads(out.read_text())
+                self.assertEqual(result["rank_count"], 2)
+                self.assertEqual(
+                    [step["device"] for step in result["critical_steps"]], [1, 1]
+                )
+                self.assertAlmostEqual(
+                    result["metrics"]["e2e_model_ms"]["total"]["mean"], 60e-6
+                )
+                self.assertEqual(
+                    result["trace_validation"]["node_traces"][1]["offset_to_node0_ns"],
+                    250,
+                )
+
+            with patch.object(
+                sys, "argv", [str(primary) if x == str(peer) else x for x in argv]
+            ):
+                with self.assertRaisesRegex(ValueError, "expected TP ranks"):
+                    trace.main()
+            with sqlite3.connect(peer) as db:
+                db.execute(
+                    "DELETE FROM NVTX_EVENTS WHERE start >= 750 AND text NOT LIKE 'sglang.measurement:%'"
+                )
+            with patch.object(sys, "argv", argv):
+                with self.assertRaisesRegex(
+                    ValueError, "step counts differ across ranks"
+                ):
+                    trace.main()
+
+
 class TestTopologyAndDPSelection(unittest.TestCase):
     def test_idle_dp_rank_with_longer_span_is_not_selected(self):
         active = _rank_step(0, 0, 10)

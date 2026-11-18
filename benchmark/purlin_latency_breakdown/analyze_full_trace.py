@@ -50,12 +50,14 @@ time with the profiler-induced launch wait removed.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import json
 import sqlite3
 import statistics
 import sys
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
@@ -198,6 +200,8 @@ class SchedulerTopology:
     attn_dp_rank: int
     attn_tp_rank: int
     moe_ep_rank: int
+    node_rank: int = 0
+    local_device: int | None = None
 
 
 @dataclass
@@ -517,11 +521,10 @@ def scheduler_ranges_by_pid(
     ranges_by_pid: dict[int, list[SchedulerRange]] = collections.defaultdict(list)
     used_markers: set[tuple[int, int]] = set()
     for start, end, global_tid, pid in rows:
-        matches = [
-            (timestamp, phase)
-            for timestamp, phase in markers_by_tid.get(int(global_tid), [])
-            if start <= timestamp <= end
-        ]
+        markers = markers_by_tid.get(int(global_tid), [])
+        left = bisect.bisect_left(markers, start, key=lambda marker: marker[0])
+        right = bisect.bisect_right(markers, end, key=lambda marker: marker[0])
+        matches = markers[left:right]
         if len(matches) != 1:
             raise ValueError(
                 f"Expected one scheduler batch-phase marker inside pid {pid} "
@@ -577,6 +580,8 @@ def load_measurement_topology(
     connection: sqlite3.Connection,
     run_id: str,
     scheduler_pids: set[int],
+    *,
+    validate_membership: bool = True,
 ) -> dict[int, SchedulerTopology]:
     rows = connection.execute(
         """
@@ -690,6 +695,12 @@ def load_measurement_topology(
             **begin_metadata,
         )
 
+    if validate_membership:
+        validate_tp_membership(topology)
+    return dict(sorted(topology.items()))
+
+
+def validate_tp_membership(topology: dict[int, SchedulerTopology]) -> None:
     membership: dict[int, set[tuple[int, int]]] = collections.defaultdict(set)
     membership_counts: collections.Counter[tuple[int, int, int]] = collections.Counter()
     for item in topology.values():
@@ -710,7 +721,6 @@ def load_measurement_topology(
                 for rank, value in sorted(membership.items())
             )
         )
-    return dict(sorted(topology.items()))
 
 
 def filter_scheduler_ranges_to_measurement(
@@ -775,6 +785,9 @@ def load_rank_step(
     extra_communication_kernel_names: frozenset[str],
     communication_kernel_totals: dict[str, list[int]],
     overlap_tolerance_ns: int = (DEFAULT_COMMUNICATION_COMPUTE_OVERLAP_TOLERANCE_NS),
+    *,
+    global_device: int | None = None,
+    time_offset_ns: int = 0,
 ) -> RankStep:
     range_start, range_end, global_tid, phase = scheduler_range
     rows = connection.execute(
@@ -827,10 +840,14 @@ def load_rank_step(
     streams: set[int] = set()
     launch_end_by_start: dict[int, int] = {}
     for start, end, name, graph_id, stream_id, correlation_id in rows:
+        start += time_offset_ns
+        end += time_offset_ns
         interval = (start, end)
         all_intervals.append(interval)
-        launch_end = launch_end_by_correlation[correlation_id]
-        launch_end_by_start[start] = max(launch_end_by_start.get(start, 0), launch_end)
+        launch_end = launch_end_by_correlation[correlation_id] + time_offset_ns
+        launch_end_by_start[start] = max(
+            launch_end_by_start.get(start, launch_end), launch_end
+        )
         streams.add(stream_id)
         if graph_id is not None:
             graph_kernel_count += 1
@@ -884,7 +901,7 @@ def load_rank_step(
         first_communication[0] if first_communication else start,
     )
     return RankStep(
-        device=device,
+        device=device if global_device is None else global_device,
         start=start,
         end=end,
         total=total,
@@ -914,7 +931,12 @@ def load_rank_step(
 
 
 def build_step_groups(rank_steps: dict[int, list[RankStep]]) -> list[StepGroup]:
-    step_count = next(iter({len(steps) for steps in rank_steps.values()}))
+    counts = {device: len(steps) for device, steps in rank_steps.items()}
+    if len(set(counts.values())) != 1:
+        raise ValueError(
+            f"Measured scheduler-step counts differ across ranks: {counts}"
+        )
+    step_count = next(iter(counts.values()))
     step_groups: list[StepGroup] = []
     for index in range(step_count):
         candidates = [steps[index] for steps in rank_steps.values()]
@@ -1512,10 +1534,122 @@ def validate_client_dp_ranks(
     return validated
 
 
+def load_traces(paths: list[Path], run_id: str, args: argparse.Namespace):
+    topology = {}
+    rank_steps = {}
+    trace_validation = {}
+    kernel_totals = collections.defaultdict(lambda: [0, 0])
+    origins = []
+    distributed = len(paths) > 1
+    communication_names = frozenset(args.communication_pattern)
+    for node_rank, path in enumerate(paths):
+        # mode=rw permits index creation but does not silently create missing reports.
+        mode = "ro" if args.skip_index_creation else "rw"
+        with closing(
+            sqlite3.connect(f"{path.resolve().as_uri()}?mode={mode}", uri=True)
+        ) as db:
+            for table in (
+                "NVTX_EVENTS",
+                "CUPTI_ACTIVITY_KIND_RUNTIME",
+                "CUPTI_ACTIVITY_KIND_KERNEL",
+                "TARGET_INFO_CUDA_CONTEXT_INFO",
+            ):
+                if not table_exists(db, table):
+                    raise ValueError(
+                        f"{path}: Nsight export lacks required table {table}"
+                    )
+            if not args.skip_index_creation:
+                create_analysis_indexes(db)
+            offset = 0
+            if distributed:
+                # Session-relative timestamps from separate hosts have independent
+                # origins. Use synchronized host UTC to express all events in
+                # node zero's trace clock; the client runs on that same node.
+                epochs = db.execute(
+                    "SELECT DISTINCT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME"
+                ).fetchall()
+                if (
+                    len(epochs) != 1
+                    or not isinstance(epochs[0][0], int)
+                    or epochs[0][0] <= 0
+                ):
+                    raise ValueError(f"{path}: expected a unique UTC capture origin")
+                origins.append(epochs[0][0])
+                offset = origins[-1] - origins[0]
+            raw_ranges = scheduler_ranges_by_pid(db)
+            local_topology = load_measurement_topology(
+                db, run_id, set(raw_ranges), validate_membership=not distributed
+            )
+            if distributed:
+                ranks_per_node = args.expected_tp // len(paths)
+                expected = set(
+                    range(node_rank * ranks_per_node, (node_rank + 1) * ranks_per_node)
+                )
+                observed = {item.tp_rank for item in local_topology.values()}
+                if observed != expected or len(local_topology) != ranks_per_node:
+                    raise ValueError(
+                        f"{path}: expected TP ranks {sorted(expected)} on node {node_rank}, found {sorted(observed)}"
+                    )
+            ranges, validation = filter_scheduler_ranges_to_measurement(
+                raw_ranges, local_topology
+            )
+            for local_device, item in local_topology.items():
+                device = item.tp_rank if distributed else local_device
+                if device in topology:
+                    raise ValueError(f"{path}: duplicate global TP rank {device}")
+                topology[device] = replace(
+                    item,
+                    device=device,
+                    node_rank=node_rank,
+                    local_device=local_device,
+                    begin=item.begin + offset,
+                    end=item.end + offset,
+                )
+                trace_validation[device] = validation[local_device]
+                print(
+                    f"Mapping scheduler steps for {path.name}, device {local_device}...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                rank_steps[device] = [
+                    load_rank_step(
+                        db,
+                        local_device,
+                        scheduler_range,
+                        communication_names,
+                        kernel_totals,
+                        args.overlap_tolerance_ns,
+                        global_device=device,
+                        time_offset_ns=offset,
+                    )
+                    for scheduler_range in ranges[local_device]
+                ]
+
+    if distributed:
+        if max(item.begin for item in topology.values()) >= min(
+            item.end for item in topology.values()
+        ):
+            raise ValueError(
+                "Aligned measurement windows do not overlap across nodes; check host clock synchronization"
+            )
+        validate_tp_membership(topology)
+    return topology, rank_steps, trace_validation, kernel_totals, origins
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("sqlite", type=Path)
     parser.add_argument("client_jsonl", type=Path)
+    parser.add_argument(
+        "--peer-sqlite",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional node trace, in Slurm node-rank order. The first positional trace is node zero.",
+    )
+    parser.add_argument(
+        "--expected-tp", type=int, help="Global TP size for multi-node traces."
+    )
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -1563,6 +1697,14 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.peer_sqlite and (
+        not args.expected_tp
+        or args.expected_tp < 1
+        or args.expected_tp % (1 + len(args.peer_sqlite))
+    ):
+        parser.error(
+            "multi-node analysis requires --expected-tp divisible by the number of traces"
+        )
     if args.overlap_tolerance_ns < 0:
         parser.error("--overlap-tolerance-ns must be non-negative")
 
@@ -1586,47 +1728,13 @@ def main() -> None:
     if any(client.get("errors", [])):
         raise ValueError(f"Client result contains request errors: {client['errors']}")
 
-    connection = sqlite3.connect(args.sqlite)
-    for required_table in (
-        "NVTX_EVENTS",
-        "CUPTI_ACTIVITY_KIND_RUNTIME",
-        "CUPTI_ACTIVITY_KIND_KERNEL",
-        "TARGET_INFO_CUDA_CONTEXT_INFO",
-    ):
-        if not table_exists(connection, required_table):
-            raise ValueError(f"Nsight export lacks required table {required_table}")
-    if not args.skip_index_creation:
-        create_analysis_indexes(connection)
-
-    raw_ranges_by_pid = scheduler_ranges_by_pid(connection)
-    topology = load_measurement_topology(connection, run_id, set(raw_ranges_by_pid))
-    ranges_by_device, trace_validation = filter_scheduler_ranges_to_measurement(
-        raw_ranges_by_pid, topology
+    trace_paths = [args.sqlite, *args.peer_sqlite]
+    topology, rank_steps, trace_validation, communication_kernel_totals, origins = (
+        load_traces(trace_paths, run_id, args)
     )
     client_dp_ranks = validate_client_dp_ranks(client, topology)
     extra_communication_kernel_names = frozenset(args.communication_pattern)
-    communication_kernel_totals: dict[str, list[int]] = collections.defaultdict(
-        lambda: [0, 0]
-    )
-    rank_steps: dict[int, list[RankStep]] = {}
-    for rank_index, (device, ranges) in enumerate(ranges_by_device.items(), start=1):
-        print(
-            f"Mapping scheduler steps for device {device} "
-            f"({rank_index}/{len(ranges_by_device)})...",
-            file=sys.stderr,
-        )
-        rank_steps[device] = [
-            load_rank_step(
-                connection,
-                device,
-                scheduler_range,
-                extra_communication_kernel_names,
-                communication_kernel_totals,
-                args.overlap_tolerance_ns,
-            )
-            for scheduler_range in ranges
-        ]
-
+    step_groups = build_step_groups(rank_steps)
     (
         prefill_cuda_graph_execution_by_device,
         prefill_cuda_graph_execution_by_step,
@@ -1635,7 +1743,6 @@ def main() -> None:
         required=args.require_prefill_cuda_graph,
     )
 
-    step_groups = build_step_groups(rank_steps)
     available_dp_ranks = sorted({item.attn_dp_rank for item in topology.values()})
     critical_steps_by_dp = {
         dp_rank: critical_steps_for_dp(step_groups, dp_rank, topology)
@@ -1712,18 +1819,19 @@ def main() -> None:
         )
         drain_step_count: int | None = len(drain_step_indices)
     else:
-        (
-            ttft_values,
-            tpot_values,
-            e2e_values,
-            request_details,
-            session_clock_origin,
-        ) = analyze_request_windows(
-            connection,
-            critical_steps_by_dp,
-            client,
-            args.overlap_tolerance_ns,
-        )
+        with closing(sqlite3.connect(args.sqlite)) as connection:
+            (
+                ttft_values,
+                tpot_values,
+                e2e_values,
+                request_details,
+                session_clock_origin,
+            ) = analyze_request_windows(
+                connection,
+                critical_steps_by_dp,
+                client,
+                args.overlap_tolerance_ns,
+            )
         selected_critical_steps = [
             step
             for dp_rank in available_dp_ranks
@@ -1892,7 +2000,7 @@ def main() -> None:
             ),
             "communication_compute_overlap_tolerance_ns": (args.overlap_tolerance_ns),
         },
-        "rank_count": len(ranges_by_device),
+        "rank_count": len(rank_steps),
         "request_count": request_count,
         "scheduler_step_count": len(step_groups),
         "prefill_step_count": sum(
@@ -1924,6 +2032,15 @@ def main() -> None:
         "request_window_validation": request_window_validation,
         "trace_validation": {
             "scheduler_range_counts_by_device": trace_validation,
+            "node_traces": [
+                {
+                    "node_rank": i,
+                    "sqlite": str(path),
+                    "utc_epoch_ns": epoch,
+                    "offset_to_node0_ns": epoch - origins[0],
+                }
+                for i, (path, epoch) in enumerate(zip(trace_paths, origins))
+            ],
             "prefill_cuda_graph_execution_by_device": (
                 prefill_cuda_graph_execution_by_device
             ),
@@ -1933,6 +2050,8 @@ def main() -> None:
             "topology": [
                 {
                     "pid": item.pid,
+                    "node_rank": item.node_rank,
+                    "local_device": item.local_device,
                     "device": item.device,
                     "begin_ns": item.begin,
                     "end_ns": item.end,

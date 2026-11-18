@@ -137,15 +137,64 @@ def stop_process_group(process: subprocess.Popen, timeout_seconds: int = 900) ->
         process.wait(timeout=30)
 
 
+def slurm_server_command(
+    args: argparse.Namespace,
+    command: list[str],
+    stop_file: Path,
+    report_base: Path | None,
+) -> list[str]:
+    step = [
+        "srun",
+        "--kill-on-bad-exit=1",
+        "--label",
+        f"--nodes={args.nnodes}",
+        f"--ntasks={args.nnodes}",
+        "--ntasks-per-node=1",
+    ]
+    if cpus := os.environ.get("SLURM_CPUS_PER_TASK"):
+        step.append(f"--cpus-per-task={cpus}")
+    step += [
+        str(args.python),
+        str(SCRIPT_DIR / "slurm_server.py"),
+        "--stop-file",
+        str(stop_file),
+    ]
+    if report_base is not None:
+        step += [
+            "--report-base",
+            str(report_base),
+            "--nsys-command",
+            str(args.nsys_command),
+        ]
+    return [
+        *step,
+        "--",
+        *command,
+        "--nnodes",
+        str(args.nnodes),
+        "--dist-init-addr",
+        args.dist_init_addr,
+    ]
+
+
 @contextlib.contextmanager
 def server_session(
+    args: argparse.Namespace,
     command: list[str],
     environment: dict[str, str],
     log_path: Path,
-    ready_host: str,
-    port: int,
-    ready_timeout: int,
+    report_base: Path | None = None,
 ) -> Iterator[subprocess.Popen]:
+    stop_file = None
+    if args.nnodes > 1:
+        # srun's SIGINT handling can terminate peers while Nsight is still
+        # writing. Each task stops its own process group and waits for its report.
+        stop_file = log_path.with_name(f".stop-{uuid.uuid4().hex}")
+        command = slurm_server_command(args, command, stop_file, report_base)
+        if args.dp == 1:
+            environment["SGLANG_DP_RANK"] = "0"
+    elif report_base is not None:
+        command = nsys_server_command(args.nsys_command, command, report_base)
     print(f"Starting server:\n  {format_command(command)}", flush=True)
     with log_path.open("w") as log_file:
         process = subprocess.Popen(
@@ -158,10 +207,30 @@ def server_session(
             start_new_session=True,
         )
         try:
-            wait_for_server(process, ready_host, port, ready_timeout, log_path)
+            wait_for_server(
+                process, args.client_host, args.port, args.ready_timeout, log_path
+            )
             yield process
         finally:
-            stop_process_group(process)
+            if stop_file is None:
+                stop_process_group(process)
+            else:
+                try:
+                    stop_file.touch()
+                    process.wait(timeout=990)
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    stop_file.unlink(missing_ok=True)
+        if stop_file is not None and process.returncode:
+            raise RuntimeError(
+                f"Slurm server step exited with status {process.returncode}; see {log_path}"
+            )
 
 
 def run_streamed(command: list[str], log_path: Path) -> None:
@@ -321,10 +390,10 @@ def profile_environment() -> dict[str, str]:
 
 
 def nsys_server_command(
-    args: argparse.Namespace, server_command: list[str], report_base: Path
+    nsys_command: Path, server_command: list[str], report_base: Path
 ) -> list[str]:
     return [
-        str(args.nsys_command),
+        str(nsys_command),
         "profile",
         "--force-overwrite=true",
         "--sample=none",
@@ -371,6 +440,8 @@ def write_manifest(args: argparse.Namespace, output_dir: Path) -> None:
         "model": args.model,
         "revision": args.revision,
         "parallelism": {"tp": args.tp, "dp": args.dp, "ep": args.ep},
+        "slurm_nodes": getattr(args, "slurm_nodes", []),
+        "dist_init_addr": args.dist_init_addr,
         "workload": {
             "input_len": args.input_len,
             "output_len": args.output_len,
@@ -426,12 +497,10 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
     if not args.skip_clean:
         ensure_absent([clean_jsonl, clean_client_log, clean_server_log], args.overwrite)
         with server_session(
+            args,
             base_server,
             clean_environment(),
             clean_server_log,
-            args.client_host,
-            args.port,
-            args.ready_timeout,
         ):
             clean_run_id = f"{variant}-clean-{uuid.uuid4().hex}"
             run_streamed(
@@ -452,10 +521,23 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
     full_client_log = output_dir / f"{variant}_full_profile.client.log"
     profile_server_log = output_dir / f"{variant}_full_profile.server.log"
     report_base = output_dir / f"{variant}_full"
-    report = report_base.with_suffix(".nsys-rep")
-    sqlite_path = report_base.with_suffix(".sqlite")
+    bases = (
+        [report_base]
+        if args.nnodes == 1
+        else [output_dir / f"{report_base.name}_node{i}" for i in range(args.nnodes)]
+    )
+    reports = [base.with_suffix(".nsys-rep") for base in bases]
+    databases = [base.with_suffix(".sqlite") for base in bases]
     breakdown = output_dir / f"{variant}_full_breakdown.json"
-    export_log = output_dir / f"{variant}_nsys_export.log"
+    export_logs = [
+        output_dir
+        / (
+            f"{variant}_nsys_export.log"
+            if args.nnodes == 1
+            else f"{variant}_node{i}_nsys_export.log"
+        )
+        for i in range(args.nnodes)
+    ]
     analysis_log = output_dir / f"{variant}_analysis.log"
     ensure_absent(
         [
@@ -465,10 +547,10 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
             full_jsonl,
             full_client_log,
             profile_server_log,
-            report,
-            sqlite_path,
+            *reports,
+            *databases,
             breakdown,
-            export_log,
+            *export_logs,
             analysis_log,
         ],
         args.overwrite,
@@ -479,12 +561,10 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
     # carrying scheduler/radix state from a complete high-concurrency run into
     # the profiled warmup.
     with server_session(
+        args,
         base_server,
         profile_environment(),
         markers_server_log,
-        args.client_host,
-        args.port,
-        args.ready_timeout,
     ):
         marker_run_id = f"{variant}-markers-{uuid.uuid4().hex}"
         run_streamed(
@@ -501,12 +581,11 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
     # Calibration C and the full trace use another fresh server. Nsight capture
     # remains inactive during warmup and starts only through /start_profile.
     with server_session(
-        nsys_server_command(args, base_server, report_base),
+        args,
+        base_server,
         profile_environment(),
         profile_server_log,
-        args.client_host,
-        args.port,
-        args.ready_timeout,
+        report_base,
     ):
         profile_run_id = f"{variant}-profile-{uuid.uuid4().hex}"
         run_streamed(
@@ -520,22 +599,23 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
             full_client_log,
         )
 
-    if not report.exists():
-        raise FileNotFoundError(f"Nsight did not create {report}")
-    export_command = [
-        str(args.nsys_command),
-        "export",
-        "--type=sqlite",
-        "--force-overwrite=true",
-        f"--output={sqlite_path}",
-        str(report),
-    ]
-    run_logged(export_command, export_log)
+    for report, sqlite_path, export_log in zip(reports, databases, export_logs):
+        if not report.exists():
+            raise FileNotFoundError(f"Nsight did not create {report}")
+        export_command = [
+            str(args.nsys_command),
+            "export",
+            "--type=sqlite",
+            "--force-overwrite=true",
+            f"--output={sqlite_path}",
+            str(report),
+        ]
+        run_logged(export_command, export_log)
 
     analysis_command = [
         str(args.python),
         str(SCRIPT_DIR / "analyze_full_trace.py"),
-        str(sqlite_path),
+        str(databases[0]),
         str(full_jsonl),
         "--label",
         variant,
@@ -545,6 +625,10 @@ def run_variant(args: argparse.Namespace, output_dir: Path, variant: str) -> Non
         "--overlap-tolerance-ns",
         str(args.overlap_tolerance_ns),
     ]
+    if args.nnodes > 1:
+        analysis_command.extend(["--expected-tp", str(args.tp)])
+        for database in databases[1:]:
+            analysis_command.extend(["--peer-sqlite", str(database)])
     if args.require_prefill_cuda_graph:
         analysis_command.append("--require-prefill-cuda-graph")
     for pattern in args.communication_pattern:
@@ -564,7 +648,17 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         nargs="+",
         choices=("baseline", "purlin"),
-        default=("baseline", "purlin"),
+        help="Defaults to both variants locally and baseline in multi-node mode.",
+    )
+    parser.add_argument(
+        "--nnodes",
+        type=int,
+        default=1,
+        help="Start one server task per node inside a Slurm batch allocation.",
+    )
+    parser.add_argument(
+        "--dist-init-addr",
+        help="Distributed rendezvous (default: first Slurm node on port 20000).",
     )
     parser.add_argument("--tp", type=int, required=True)
     parser.add_argument("--dp", type=int, default=1)
@@ -694,6 +788,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--nsys-command", type=Path, default=Path("nsys"))
     args = parser.parse_args()
+    if args.nnodes < 1:
+        parser.error("--nnodes must be positive")
+    if args.variants is None:
+        args.variants = ("baseline",) if args.nnodes > 1 else ("baseline", "purlin")
+    if args.nnodes > 1:
+        if "purlin" in args.variants:
+            parser.error("multi-node mode supports the baseline variant only")
+        if args.tp < args.nnodes or args.tp % args.nnodes:
+            parser.error("--tp must divide evenly across nodes")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
     if args.overlap_tolerance_ns < 0:
@@ -718,6 +821,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.nnodes > 1:
+        allocation = os.environ.get("SLURM_JOB_NODELIST")
+        if not allocation:
+            raise ValueError("--nnodes requires a Slurm allocation")
+        args.slurm_nodes = subprocess.check_output(
+            ["scontrol", "show", "hostnames", allocation], text=True
+        ).splitlines()
+        if len(args.slurm_nodes) != args.nnodes:
+            raise ValueError(
+                f"Requested {args.nnodes} nodes, allocation contains {args.slurm_nodes}"
+            )
+        local_node = os.environ.get(
+            "SLURMD_NODENAME", socket.gethostname().split(".")[0]
+        )
+        if local_node != args.slurm_nodes[0]:
+            raise ValueError(
+                f"Run the suite/controller on {args.slurm_nodes[0]} for client clock alignment"
+            )
+        if not args.dist_init_addr:
+            args.dist_init_addr = f"{args.slurm_nodes[0]}:20000"
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if port_is_open(args.client_host, args.port):

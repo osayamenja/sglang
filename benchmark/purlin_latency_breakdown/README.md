@@ -279,6 +279,34 @@ for example `--server-arg=--some-option=some-value`; a boolean flag uses
 baseline and Purlin commands. The only automatic variant difference is
 `--enable-purlin`.
 
+### Two-node stock SGLang on Slurm
+
+From the checkout root, submit `sbatch benchmark/purlin_latency_breakdown/glm53_slurm.sbatch`
+to run GLM-5.3 on two eight-GPU nodes. The batch script runs one client on the
+first compute node and one server launcher per node, with TP16/EP16/DP1. It
+measures 8192 input and 1024 output tokens at concurrency 1 and 16, using 8
+and 128 requests respectively in each clean, marker-only, and profiled run.
+The prefill chunk is 8192 tokens and the graph ceiling is 2048. Larger
+prefills can run eagerly and their graph coverage is reported in the breakdown.
+
+Both workers need the shared checkout, model, and output directory, plus an
+Nsight CLI supporting `node:nvtx-precapture`. Set `NSYS_COMMAND` if the
+executable is outside PATH. Allow storage for both raw reports and both indexed
+SQLite exports per concurrency. Each launcher uses a private node-local Triton
+cache. Results land in `benchmark_results/glm53_<jobid>/c{1,16}/`, including
+`baseline_full_breakdown.json` and the clean client latency JSONL.
+
+For other allocations, pass `--nnodes` to the serving runner on the first
+allocated node. Multi-node mode runs stock SGLang and defaults the rendezvous
+to the first node on port 20000. Each profiling task records its own
+`*_full_node<N>.nsys-rep`. To reanalyze, pass node zero's SQLite file first
+and append `--peer-sqlite <path>` in node-rank order and `--expected-tp <size>`.
+Scheduler PIDs, CUDA device IDs, and kernel correlations are resolved inside
+each export. Global TP rank identifies each GPU in the combined result.
+The analyzer uses Nsight's UTC capture origins to align the worker timelines
+and node zero's system-clock origin to align the client. Cross-host timing
+accuracy depends on the nodes' wall-clock synchronization (e.g. PTP).
+
 ### B300 example
 
 The following translates the B300 server configuration for
