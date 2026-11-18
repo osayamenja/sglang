@@ -24,6 +24,7 @@ import analyze_full_trace as trace  # noqa: E402
 import analyze_one_batch_trace as one_batch_trace  # noqa: E402
 import run_one_batch_suite as one_batch_suite  # noqa: E402
 import run_suite as suite  # noqa: E402
+import summarize_baseline as baseline_summary  # noqa: E402
 import summarize_one_batch_results as one_batch_summary  # noqa: E402
 import summarize_results as summary  # noqa: E402
 
@@ -463,9 +464,21 @@ class TestSlurmBreakdown(unittest.TestCase):
                 patch.object(sys, "argv", worker_argv),
                 patch.dict(suite.os.environ, SLURM_NODEID="1"),
                 patch.object(slurm_server.subprocess, "Popen") as popen,
-                patch.object(slurm_server, "stop_process_group"),
+                patch.object(slurm_server, "stop_process_group") as stop_group,
+                patch.object(slurm_server.time, "sleep") as wait_for_peer,
             ):
+                popen.return_value.poll.return_value = None
+                peer_ack, local_ack = suite.shutdown_ack_files(stop, 2)
+
+                def acknowledge_peer(_delay):
+                    self.assertTrue(local_ack.exists())
+                    stop_group.assert_not_called()
+                    peer_ack.touch()
+
+                wait_for_peer.side_effect = acknowledge_peer
                 slurm_server.main()
+                wait_for_peer.assert_called_once()
+                stop_group.assert_called_once_with(popen.return_value)
             remote = popen.call_args.args[0]
             self.assertEqual(remote[:2], ["nsys", "profile"])
             self.assertIn(f"--output={root}/profile_node1", remote)
@@ -942,6 +955,50 @@ class TestRequestAttribution(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(trace.is_communication_kernel(name, frozenset()))
         self.assertFalse(trace.is_communication_kernel("memcpy_kernel", frozenset()))
+
+
+class TestBaselineSummary(unittest.TestCase):
+    def test_full_model_denominator_and_optional_client_files(self):
+        components = trace.build_components(
+            dict(
+                compute=4.0,
+                communication=2.0,
+                uncovered=1.0,
+                launch_stall_from_communication=2.0,
+                launch_stall_from_uncovered=1.0,
+            )
+        )
+        metric = trace.summarize_metric([components])
+        client = {key: 11.0 for key, _ in summary.METRICS.values()}
+        breakdown = dict(
+            label="baseline",
+            run_id="profile",
+            concurrency=1,
+            rank_count=16,
+            request_count=8,
+            definition={"communication_compute_overlap_tolerance_ns": 152000},
+            client_validation=client,
+            metrics={key: metric for _, key in summary.METRICS.values()},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "baseline_full_breakdown.json"
+            path.write_text(json.dumps(breakdown))
+            result = baseline_summary.summarize_baseline(path)
+            for values in result["metrics"].values():
+                self.assertEqual(values["client_mean_ms"], {"profiled": 11.0})
+                self.assertEqual(values["model_total_ms"], 10.0)
+                self.assertEqual(
+                    values["components"]["communication"],
+                    {"mean_ms": 2.0, "percent_of_model_total": 20.0},
+                )
+            for phase in ("clean", "scheduler_markers"):
+                (root / f"baseline_{phase}.jsonl").write_text(json.dumps(client) + "\n")
+            result = baseline_summary.summarize_baseline(path)
+            self.assertEqual(
+                result["metrics"]["tpot"]["client_mean_ms"],
+                {"clean": 11.0, "scheduler_markers": 11.0, "profiled": 11.0},
+            )
 
 
 class TestSummaryWording(unittest.TestCase):

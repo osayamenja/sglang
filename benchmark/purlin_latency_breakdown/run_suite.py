@@ -113,7 +113,8 @@ def stop_process_group(process: subprocess.Popen, timeout_seconds: int = 900) ->
     if process.poll() is not None:
         return
     print(f"Stopping server process group {process.pid}...", flush=True)
-    os.killpg(process.pid, signal.SIGINT)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGINT)
     deadline = time.monotonic() + timeout_seconds
     next_update = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -127,14 +128,22 @@ def stop_process_group(process: subprocess.Popen, timeout_seconds: int = 900) ->
         time.sleep(1)
 
     print("Server did not stop after SIGINT; sending SIGTERM.", flush=True)
-    os.killpg(process.pid, signal.SIGTERM)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
     try:
         process.wait(timeout=30)
         return
     except subprocess.TimeoutExpired:
         print("Server did not stop after SIGTERM; sending SIGKILL.", flush=True)
-        os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=30)
+
+
+def shutdown_ack_files(stop_file: Path, nnodes: int) -> list[Path]:
+    return [
+        stop_file.with_name(f"{stop_file.name}.ack-{node}") for node in range(nnodes)
+    ]
 
 
 def slurm_server_command(
@@ -158,6 +167,8 @@ def slurm_server_command(
         str(SCRIPT_DIR / "slurm_server.py"),
         "--stop-file",
         str(stop_file),
+        "--launcher-nodes",
+        str(args.nnodes),
     ]
     if report_base is not None:
         step += [
@@ -217,7 +228,8 @@ def server_session(
             else:
                 try:
                     stop_file.touch()
-                    process.wait(timeout=990)
+                    # Includes the worker acknowledgement barrier and Nsight finalization.
+                    process.wait(timeout=1110)
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -227,6 +239,8 @@ def server_session(
                             process.kill()
                             process.wait()
                     stop_file.unlink(missing_ok=True)
+                    for ack in shutdown_ack_files(stop_file, args.nnodes):
+                        ack.unlink(missing_ok=True)
         if stop_file is not None and process.returncode:
             raise RuntimeError(
                 f"Slurm server step exited with status {process.returncode}; see {log_path}"
@@ -882,6 +896,21 @@ def main() -> None:
         )
         print(f"Wrote comparison: {summary_path}", flush=True)
         report_capture_quality(summary_path)
+    if tuple(args.variants) == ("baseline",):
+        summary_path = args.output_dir / "baseline_summary.json"
+        ensure_absent([summary_path], args.overwrite)
+        subprocess.run(
+            [
+                str(args.python),
+                str(SCRIPT_DIR / "summarize_baseline.py"),
+                str(args.output_dir),
+                "--output",
+                str(summary_path),
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+        print(f"Wrote baseline summary: {summary_path}", flush=True)
     print(f"Suite complete: {args.output_dir}", flush=True)
 
 

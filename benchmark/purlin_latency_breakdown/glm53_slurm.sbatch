@@ -27,6 +27,7 @@ for concurrency in 1 16; do
         --no-require-prefill-cuda-graph --cuda-graph-max-bs-decode 256 \
         --concurrency "$concurrency" --input-len 8192 --output-len 1024 \
         --num-prompts "$prompts" --trace-prompts "$prompts" --warmup-requests "$warmups" \
+        --overlap-tolerance-ns 150000 \
         --nsys-command "${NSYS_COMMAND:-nsys}" \
         --output-dir "benchmark_results/glm53_${SLURM_JOB_ID}/c${concurrency}"
 done

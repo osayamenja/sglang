@@ -296,6 +296,21 @@ SQLite exports per concurrency. Each launcher uses a private node-local Triton
 cache. Results land in `benchmark_results/glm53_<jobid>/c{1,16}/`, including
 `baseline_full_breakdown.json` and the clean client latency JSONL.
 
+A baseline-only suite also writes `baseline_summary.json`. To summarize an
+existing result, pass its directory or the baseline breakdown JSON directly.
+
+```bash
+result_dir=benchmark_results/glm53_45/c1
+python benchmark/purlin_latency_breakdown/summarize_baseline.py "$result_dir" \
+  --output "$result_dir/baseline_summary.json"
+```
+
+The terminal table shows mean model latency and communication time and share
+for TTFT, TPOT, and E2E. The JSON includes all component times and percentages.
+Percentages use the full model-side total, including launch stall, as their
+denominator. Profiled client latencies come from the trace. Clean and
+scheduler-marker client latencies are included when their JSONL files are present.
+
 For other allocations, pass `--nnodes` to the serving runner on the first
 allocated node. Multi-node mode runs stock SGLang and defaults the rendezvous
 to the first node on port 20000. Each profiling task records its own
@@ -459,7 +474,7 @@ variant with `--resume`.
   `--baseline-breakdown`/`--purlin-breakdown` paths select alternative
   breakdown files.
 
-All three programs use only the Python standard library. The external work is
+These scripts use only the Python standard library. The external work is
 performed by the checkout's `sglang`/Python executables and the `nsys` command,
 whose paths can be overridden on the command line.
 
